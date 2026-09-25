@@ -3,6 +3,7 @@ numpy
 pyarrow
 scikit-learn
 rapidfuzz
+jellyfish
 sentence-transformers
 lightgbm
 xgboost

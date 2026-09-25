@@ -20,6 +20,8 @@ from src.preprocessing import (
     normalize_name,
     normalize_name_series,
     normalize_text,
+    strip_accents,
+    strip_accents_series,
 )
 
 
@@ -113,20 +115,68 @@ class TestAddressNormalization(unittest.TestCase):
         # legal-entity suffix, and must survive normalize_address unlike normalize_name.
         self.assertIn("co", normalize_address("Co Rd 42").split())
 
+    def test_street_designator_synonyms_collapse_to_same_value(self):
+        self.assertEqual(normalize_address("123 Main Rd"), normalize_address("123 Main Road"))
+        self.assertEqual(normalize_address("1 Elm Ave"), normalize_address("1 Elm Avenue"))
+        self.assertEqual(normalize_address("5 Victory Blvd"), normalize_address("5 Victory Boulevard"))
+
+    def test_st_is_not_expanded_due_to_saint_ambiguity(self):
+        # "St" is genuinely ambiguous (Street vs. Saint) - guessing wrong would corrupt
+        # real address content, so normalize_address must leave it untouched rather
+        # than silently assume "Street".
+        self.assertEqual(normalize_address("St Louis"), "st louis")
+        self.assertNotIn("street", normalize_address("St Louis"))
+
+
+class TestFrenchAndUnicodeNormalization(unittest.TestCase):
+    """France appears only in the test set (never in training data), and country is
+    never hardcoded anywhere in this pipeline - these guard the zero-shot path."""
+
+    def test_strip_accents_scalar(self):
+        self.assertEqual(strip_accents("Société"), "Societe")
+        self.assertEqual(strip_accents("Café"), "Cafe")
+        self.assertEqual(strip_accents("Château"), "Chateau")
+
+    def test_strip_accents_series(self):
+        result = strip_accents_series(pd.Series(["Société", "Café", None]))
+        self.assertEqual(list(result), ["Societe", "Cafe", ""])
+
+    def test_accents_stripped_before_punctuation_removal(self):
+        # Without accent-stripping first, the old ASCII-only punctuation regex would
+        # delete "é" outright ("soci t ") instead of folding it to "e" ("societe").
+        self.assertEqual(normalize_name("Société Générale"), "societe generale")
+
+    def test_french_legal_suffixes_removed(self):
+        variants = ["Boulangerie Martin SARL", "Boulangerie Martin SAS", "Boulangerie Martin SA"]
+        normalized = {normalize_name(v) for v in variants}
+        self.assertEqual(normalized, {"boulangerie martin"})
+
+    def test_french_and_english_suffix_variants_of_same_business_collapse(self):
+        # A French-registered version and a US-registered version of a conceptually
+        # equivalent legal form should both reduce to the bare business name.
+        self.assertEqual(normalize_name("Dupont Consulting EURL"), "dupont consulting")
+        self.assertEqual(normalize_name("Dupont Consulting LLC"), "dupont consulting")
+
+    def test_french_address_with_accents_normalizes(self):
+        result = normalize_address("12 Rue de l'Église, Boulevard Saint-Michel")
+        self.assertNotIn("é", result)
+        self.assertIn("eglise", result)
+        self.assertIn("boulevard", result)
+
 
 class TestSeriesVsScalarConsistency(unittest.TestCase):
     """The vectorized *_series functions must match the scalar functions element-wise,
     since blocking.py relies on the vectorized path for performance."""
 
     def test_name_series_matches_scalar(self):
-        values = ["XYZ Pvt Ltd", "Smith & Sons", None, "  Acme  Retail  "]
+        values = ["XYZ Pvt Ltd", "Smith & Sons", None, "  Acme  Retail  ", "Société Générale SARL"]
         s = pd.Series(values)
         vectorized = list(normalize_name_series(s))
         scalar = [normalize_name(v) for v in values]
         self.assertEqual(vectorized, scalar)
 
     def test_address_series_matches_scalar(self):
-        values = ["123 Main St., Apt #4", "Co Rd 42", None, "  "]
+        values = ["123 Main St., Apt #4", "Co Rd 42", None, "  ", "12 Rue de l'Église, Bd Saint-Michel"]
         s = pd.Series(values)
         vectorized = list(normalize_address_series(s))
         scalar = [normalize_address(v) for v in values]

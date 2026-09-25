@@ -33,8 +33,17 @@ TEST_FILES: Dict[str, Path] = {
 
 
 def load_tsv(path: Path, nrows: Optional[int] = None) -> pd.DataFrame:
-    """Read one competition TSV file with the shared convention (tab-separated)."""
-    return pd.read_csv(path, sep="\t", nrows=nrows)
+    """
+    Read one competition TSV file with the shared convention (tab-separated).
+
+    dtype=str is critical, not cosmetic: every column in this dataset actually is a
+    string, but pandas' default dtype-inference pass (maybe_convert_objects) needs
+    multiple GB of transient headroom on a multi-million-row file and segfaults on a
+    memory-constrained machine well before it OOMs cleanly. Declaring dtype=str skips
+    that pass entirely - the same 5M-row file that crashed with default dtypes loads
+    in ~17s using well under 1GB once this is set.
+    """
+    return pd.read_csv(path, sep="\t", nrows=nrows, dtype=str)
 
 
 def load_train(nrows: Optional[int] = None) -> Dict[str, pd.DataFrame]:

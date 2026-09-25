@@ -22,11 +22,13 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
+from rapidfuzz.distance import JaroWinkler, LCSseq
 
 from src.data_loader import load_tsv
 from src.preprocessing import add_clean_columns
 
 _NUMERIC_RE = re.compile(r"\d+")
+_POSTAL_RE = re.compile(r"\d{5,6}\b")
 
 ID_COLUMNS = ["source1_entity_id", "candidate_entity_id", "source"]
 
@@ -34,8 +36,13 @@ FEATURE_COLUMNS = [
     "token_sort_ratio",
     "token_set_ratio",
     "partial_ratio",
+    "name_ratio",
+    "name_wratio",
+    "name_jaro_winkler",
     "address_token_similarity",
     "address_partial_similarity",
+    "address_jaro_winkler",
+    "address_lcs_ratio",
     "exact_country_match",
     "first_word_match",
     "prefix_match",
@@ -43,6 +50,12 @@ FEATURE_COLUMNS = [
     "address_length_diff",
     "numeric_overlap",
     "jaccard_token_similarity",
+    "name_bigram_jaccard",
+    "name_trigram_dice",
+    "postal_code_match",
+    "rank_within_entity",
+    "is_top1_for_entity",
+    "score_margin_to_next",
 ]
 
 
@@ -64,6 +77,24 @@ def _jaccard(a: set, b: set) -> float:
         return 0.0
     union = a | b
     return len(a & b) / len(union) if union else 0.0
+
+
+def _dice(a: set, b: set) -> float:
+    if not a and not b:
+        return 0.0
+    total = len(a) + len(b)
+    return 2 * len(a & b) / total if total else 0.0
+
+
+def _char_ngrams(text: str, n: int) -> set:
+    if len(text) < n:
+        return {text} if text else set()
+    return {text[i:i + n] for i in range(len(text) - n + 1)}
+
+
+def _postal_code(text: str):
+    matches = _POSTAL_RE.findall(text)
+    return matches[-1] if matches else None
 
 
 def _build_lookup(df: pd.DataFrame, id_col: str = "entity_id") -> Dict[str, Tuple[str, str, str]]:
@@ -117,8 +148,13 @@ def generate_features(
     token_sort_ratio = np.empty(n, dtype=np.float32)
     token_set_ratio = np.empty(n, dtype=np.float32)
     partial_ratio = np.empty(n, dtype=np.float32)
+    name_ratio = np.empty(n, dtype=np.float32)
+    name_wratio = np.empty(n, dtype=np.float32)
+    name_jaro_winkler = np.empty(n, dtype=np.float32)
     address_token_similarity = np.empty(n, dtype=np.float32)
     address_partial_similarity = np.empty(n, dtype=np.float32)
+    address_jaro_winkler = np.empty(n, dtype=np.float32)
+    address_lcs_ratio = np.empty(n, dtype=np.float32)
     exact_country_match = np.empty(n, dtype=np.int8)
     first_word_match = np.empty(n, dtype=np.int8)
     prefix_match = np.empty(n, dtype=np.int8)
@@ -126,6 +162,9 @@ def generate_features(
     address_length_diff = np.empty(n, dtype=np.int32)
     numeric_overlap = np.empty(n, dtype=np.float32)
     jaccard_token_similarity = np.empty(n, dtype=np.float32)
+    name_bigram_jaccard = np.empty(n, dtype=np.float32)
+    name_trigram_dice = np.empty(n, dtype=np.float32)
+    postal_code_match = np.empty(n, dtype=np.int8)
 
     empty_record = ("", "", "")
     for i, (s1_id, cand_id, src) in enumerate(zip(s1_ids, cand_ids, sources)):
@@ -135,9 +174,14 @@ def generate_features(
         token_sort_ratio[i] = fuzz.token_sort_ratio(name1, name2)
         token_set_ratio[i] = fuzz.token_set_ratio(name1, name2)
         partial_ratio[i] = fuzz.partial_ratio(name1, name2)
+        name_ratio[i] = fuzz.ratio(name1, name2)
+        name_wratio[i] = fuzz.WRatio(name1, name2)
+        name_jaro_winkler[i] = JaroWinkler.normalized_similarity(name1, name2) * 100.0
 
         address_token_similarity[i] = fuzz.token_sort_ratio(addr1, addr2)
         address_partial_similarity[i] = fuzz.partial_ratio(addr1, addr2)
+        address_jaro_winkler[i] = JaroWinkler.normalized_similarity(addr1, addr2) * 100.0
+        address_lcs_ratio[i] = LCSseq.normalized_similarity(addr1, addr2) * 100.0
 
         exact_country_match[i] = int(bool(country1) and country1 == country2)
 
@@ -146,9 +190,13 @@ def generate_features(
         prefix_match[i] = int(bool(name1) and name1[:prefix_len] == name2[:prefix_len])
         name_length_diff[i] = abs(len(name1) - len(name2))
         jaccard_token_similarity[i] = _jaccard(set(t1), set(t2))
+        name_bigram_jaccard[i] = _jaccard(_char_ngrams(name1, 2), _char_ngrams(name2, 2))
+        name_trigram_dice[i] = _dice(_char_ngrams(name1, 3), _char_ngrams(name2, 3))
 
         address_length_diff[i] = abs(len(addr1) - len(addr2))
         numeric_overlap[i] = _jaccard(_numeric_tokens(addr1), _numeric_tokens(addr2))
+        postal1, postal2 = _postal_code(addr1), _postal_code(addr2)
+        postal_code_match[i] = int(postal1 is not None and postal1 == postal2)
 
     features = pd.DataFrame({
         "source1_entity_id": s1_ids,
@@ -157,8 +205,13 @@ def generate_features(
         "token_sort_ratio": token_sort_ratio,
         "token_set_ratio": token_set_ratio,
         "partial_ratio": partial_ratio,
+        "name_ratio": name_ratio,
+        "name_wratio": name_wratio,
+        "name_jaro_winkler": name_jaro_winkler,
         "address_token_similarity": address_token_similarity,
         "address_partial_similarity": address_partial_similarity,
+        "address_jaro_winkler": address_jaro_winkler,
+        "address_lcs_ratio": address_lcs_ratio,
         "exact_country_match": exact_country_match,
         "first_word_match": first_word_match,
         "prefix_match": prefix_match,
@@ -166,11 +219,44 @@ def generate_features(
         "address_length_diff": address_length_diff,
         "numeric_overlap": numeric_overlap,
         "jaccard_token_similarity": jaccard_token_similarity,
+        "name_bigram_jaccard": name_bigram_jaccard,
+        "name_trigram_dice": name_trigram_dice,
+        "postal_code_match": postal_code_match,
     })
+
+    features = _add_relative_rank_features(features)
 
     if verbose:
         print(f"Generated {n:,} feature rows in {time.time() - t0:.1f}s")
 
+    return features
+
+
+def _add_relative_rank_features(features: pd.DataFrame) -> pd.DataFrame:
+    """
+    Entity-relative ranking signals: among all candidates blocked for the SAME
+    Source1 entity, how does this one compare? A candidate that looks similar in
+    isolation but is clearly second-best within its own entity's pool is much weaker
+    evidence than the single best-scoring candidate for that entity - these features
+    let the model use that group structure instead of scoring every pair as if it
+    existed alone. Fully vectorized (groupby rank/transform), no per-entity Python loop.
+    """
+    basis = (features["token_sort_ratio"].astype(np.float64) + features["address_token_similarity"]) / 2.0
+    groups = features["source1_entity_id"]
+
+    rank = basis.groupby(groups, sort=False).rank(method="first", ascending=False)
+    top1_score = basis.groupby(groups, sort=False).transform("max")
+    second_place_score = (
+        basis.where(rank == 2).groupby(groups, sort=False).transform("max")
+    )
+    # No runner-up (this entity has only one candidate) -> margin defaults to the
+    # candidate's own score, i.e. "no competition, maximally uncontested".
+    margin = (top1_score - second_place_score).fillna(top1_score)
+
+    features = features.copy()
+    features["rank_within_entity"] = rank.astype(np.int32)
+    features["is_top1_for_entity"] = (rank == 1).astype(np.int8)
+    features["score_margin_to_next"] = np.where(rank == 1, margin, 0.0).astype(np.float32)
     return features
 
 
@@ -223,7 +309,7 @@ def main() -> None:
     source1 = add_clean_columns(load_tsv(os.path.join(args.data_dir, f"{prefix}_source1.tsv")))
     s2 = add_clean_columns(load_tsv(os.path.join(args.data_dir, f"{prefix}_source2.tsv")))
     s3 = add_clean_columns(load_tsv(os.path.join(args.data_dir, f"{prefix}_source3.tsv")))
-    candidate_pairs = pd.read_csv(args.candidate_pairs, sep="\t")
+    candidate_pairs = pd.read_csv(args.candidate_pairs, sep="\t", dtype=str)
     print(f"Loaded sources + candidate pairs in {time.time() - t0:.1f}s "
           f"({len(candidate_pairs):,} pairs)")
 

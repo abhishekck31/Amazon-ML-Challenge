@@ -194,11 +194,14 @@ def train_all_models(
     random_state: int = 42,
     num_boost_round: int = 500,
     early_stopping_rounds: int = 30,
+    include_ensemble: bool = True,
     verbose: bool = True,
 ) -> Dict[str, TrainedModel]:
-    """Train every model in MODEL_TRAINERS on train_pairs, evaluate on val_pairs.
-    Returns {name: TrainedModel}, skipping any trainer that returns None (catboost
-    when not installed)."""
+    """Train every model in MODEL_TRAINERS on train_pairs, evaluate on val_pairs, then
+    (if include_ensemble and >=2 boosting models trained successfully) add an
+    "ensemble" entry averaging their probabilities - competing for best-model
+    selection on equal footing with the individual models. Returns {name:
+    TrainedModel}, skipping any trainer that returns None (catboost when not installed)."""
     X_train = get_feature_matrix(train_pairs)
     y_train = train_pairs["label"].to_numpy()
     X_val = get_feature_matrix(val_pairs)
@@ -224,7 +227,59 @@ def train_all_models(
                 f"precision={m['precision']:.4f} recall={m['recall']:.4f} "
                 f"avg_precision={m['average_precision']:.4f} ({elapsed:.1f}s)"
             )
+
+    boosting_names = [n for n in ("lightgbm", "xgboost", "catboost") if n in results]
+    if include_ensemble and len(boosting_names) >= 2:
+        t0 = time.time()
+        ensemble_result = build_ensemble({n: results[n] for n in boosting_names}, y_val)
+        results["ensemble"] = ensemble_result
+        if verbose:
+            m = ensemble_result.metrics
+            print(
+                f"ensemble({'+'.join(boosting_names)}): macro_f0.5={m['macro_f0.5']:.4f} "
+                f"threshold={m['threshold']:.3f} precision={m['precision']:.4f} "
+                f"recall={m['recall']:.4f} avg_precision={m['average_precision']:.4f} "
+                f"({time.time() - t0:.1f}s)"
+            )
     return results
+
+
+def build_ensemble(
+    components: Dict[str, TrainedModel],
+    y_val: np.ndarray,
+    weights: Optional[Dict[str, float]] = None,
+) -> TrainedModel:
+    """
+    Average the predicted probabilities of several ALREADY-TRAINED component models
+    (no retraining) - by default every boosting model in `components`, equally
+    weighted. Different algorithms (gradient boosting implementations with different
+    split-finding/regularization strategies) make somewhat independent errors, so
+    averaging tends to reduce variance versus any single model.
+
+    The resulting TrainedModel's save_fn writes each component to its own file plus a
+    small JSON manifest (ensemble.ensemble) listing them; src.threshold_search's
+    load_predict_proba_fn knows how to reload and re-average from that manifest.
+    """
+    names = list(components.keys())
+    if len(names) < 2:
+        raise ValueError("build_ensemble needs at least 2 component models.")
+    weights = weights or {n: 1.0 for n in names}
+    total_weight = sum(weights[n] for n in names)
+    val_probs = sum(weights[n] * components[n].val_probs for n in names) / total_weight
+
+    def save_fn(path: Path):
+        manifest = {"components": []}
+        for name in names:
+            result = components[name]
+            component_path = path.parent / f"ensemble_{name}{result.extension}"
+            result.save_fn(component_path)
+            manifest["components"].append({
+                "name": name, "path": str(component_path), "extension": result.extension,
+                "weight": weights[name],
+            })
+        path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    return _finalize("ensemble", y_val, val_probs, save_fn, ".ensemble", model=components)
 
 
 def select_best_model(results: Dict[str, TrainedModel]) -> str:

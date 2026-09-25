@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+import jellyfish
 import numpy as np
 import pandas as pd
 
@@ -91,17 +92,44 @@ def _key_country_name_initials(df: pd.DataFrame, max_tokens: int = 5) -> pd.Seri
     return df["country"].fillna("").str.upper() + "|" + initials_series
 
 
-def build_block_indices(key_series: pd.Series) -> Dict[str, np.ndarray]:
+def _key_country_name_phonetic(df: pd.DataFrame) -> pd.Series:
+    """Rule 6c: country + Metaphone phonetic code of the name's first word. Catches
+    transliteration variants that no exact-match rule can (e.g. "Kumar" vs "Coomar",
+    "Sri" vs "Shree") - especially common where the same Indian business name gets
+    romanized differently across sources. jellyfish has no vectorized batch API, so
+    this runs one C-accelerated call per row via .apply(), same pattern as the
+    initials rule above."""
+    first_word = df["name_clean"].fillna("").str.split().str[0].fillna("")
+    phonetic = first_word.apply(lambda w: jellyfish.metaphone(w) if w else "")
+    return df["country"].fillna("").str.upper() + "|" + phonetic
+
+
+def build_block_indices(key_series: pd.Series, max_df_ratio: Optional[float] = None) -> Dict[str, np.ndarray]:
     """
     Turn a per-row string key into an inverted index {block_key: array_of_row_positions},
     using groupby(...).indices (vectorized, Cython-backed grouping - no iterrows()).
 
     Rows whose key is the empty string are dropped: an empty key usually means missing
     data (e.g. blank name/address) and would otherwise form one giant, useless block.
+
+    `max_df_ratio`, if given, additionally drops any key shared by more than that
+    fraction of rows. This matters at full dataset scale in a way it doesn't on a
+    small sample: _pairs_from_matching_blocks's max_block_pairs cap only skips a block
+    whose cross product is individually huge, but a broad key like a common first word
+    ("the", "global", ...) forms thousands of merely medium-sized blocks across a
+    multi-million-row dataset that each pass that cap yet sum to tens of millions of
+    low-value pairs. Capping document frequency here - the same technique
+    build_token_index already uses for token blocking - prunes those low-signal keys
+    before pair generation instead of after, which is what actually keeps full-scale
+    runs tractable.
     """
     positions = pd.Series(np.arange(len(key_series)))
     grouped = positions.groupby(key_series.values).indices
-    return {k: v.astype(np.int64) for k, v in grouped.items() if k and not k.endswith("|")}
+    index = {k: v.astype(np.int64) for k, v in grouped.items() if k and not k.endswith("|")}
+    if max_df_ratio is not None and len(key_series):
+        max_count = max_df_ratio * len(key_series)
+        index = {k: v for k, v in index.items() if len(v) <= max_count}
+    return index
 
 
 def get_candidate_indices(block_index: Dict[str, np.ndarray], keys) -> np.ndarray:
@@ -187,16 +215,32 @@ class BlockingRule:
     kwargs: dict = field(default_factory=dict)
 
 
+# max_df_ratio=0.01 on the broad single-key rules below is not optional polish - at
+# full dataset scale (millions of rows), a low-cardinality key like a common first
+# word ("the", "global", ...) forms thousands of individually medium-sized blocks
+# that each pass the max_block_pairs cross-product cap yet sum to tens of millions of
+# low-signal pairs (observed directly: country_name_firstword alone produced 14.2M
+# raw pairs against just Source2 on the full training set before this cap was added).
+# Capping document frequency here prunes those low-value keys before pair generation,
+# which is what actually keeps a full-scale run's memory/time tractable.
+BROAD_KEY_MAX_DF_RATIO = 0.01
+
 DEFAULT_RULES: List[BlockingRule] = [
-    BlockingRule("country_name_prefix3", "single_key", key_fn=lambda df: _key_country_name_prefix(df, 3)),
-    BlockingRule("country_name_firstword", "single_key", key_fn=_key_country_name_firstword),
+    BlockingRule("country_name_prefix3", "single_key", key_fn=lambda df: _key_country_name_prefix(df, 3),
+                 kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
+    BlockingRule("country_name_firstword", "single_key", key_fn=_key_country_name_firstword,
+                 kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
     BlockingRule("country_address_prefix10", "single_key", key_fn=lambda df: _key_country_address_prefix(df, 10)),
     BlockingRule("name_token", "token", column="name_clean",
                  kwargs={"min_token_len": 3, "max_df_ratio": 0.01}),
     BlockingRule("address_numeric_token", "numeric_token", column="address_clean",
                  kwargs={"min_digits": 3}),
-    BlockingRule("country_name_lastword", "single_key", key_fn=_key_country_name_lastword),
-    BlockingRule("country_name_initials", "single_key", key_fn=lambda df: _key_country_name_initials(df, 5)),
+    BlockingRule("country_name_lastword", "single_key", key_fn=_key_country_name_lastword,
+                 kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
+    BlockingRule("country_name_initials", "single_key", key_fn=lambda df: _key_country_name_initials(df, 5),
+                 kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
+    BlockingRule("country_name_phonetic", "single_key", key_fn=_key_country_name_phonetic,
+                 kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
 ]
 
 
@@ -205,7 +249,7 @@ def build_source_block_indices(df: pd.DataFrame, rules: List[BlockingRule]) -> D
     indices: Dict[str, Dict[str, np.ndarray]] = {}
     for rule in rules:
         if rule.kind == "single_key":
-            indices[rule.name] = build_block_indices(rule.key_fn(df))
+            indices[rule.name] = build_block_indices(rule.key_fn(df), **rule.kwargs)
         elif rule.kind == "token":
             indices[rule.name] = build_token_index(df, rule.column, **rule.kwargs)
         elif rule.kind == "numeric_token":
@@ -322,6 +366,59 @@ def generate_candidate_pairs(
 
 
 # --------------------------------------------------------------------------- #
+# Submission-format grouping (one row per Source1 entity)
+#
+# The competition requires BOTH candidate_pairs.tsv and matching_results.tsv in this
+# shape - source1_entity_id, then a deduplicated/sorted/comma-joined id list, with
+# every Source1 entity present exactly once (empty string if it has none). This is
+# the same grouping operation for both files (candidate_pairs.tsv groups ALL scored
+# candidates; matching_results.tsv groups only the ones that cleared the decision
+# threshold), so it lives here once and src.inference reuses it rather than
+# reimplementing the same groupby.
+# --------------------------------------------------------------------------- #
+
+def group_entity_ids(
+    pairs: pd.DataFrame,
+    all_entity_ids: Iterable[str],
+    id_col: str = "source1_entity_id",
+    cand_col: str = "candidate_entity_id",
+    out_col: str = "candidate_entity_ids",
+) -> pd.DataFrame:
+    """One row per id in `all_entity_ids`, with the matching rows of `pairs` grouped
+    into a deduplicated, sorted, comma-joined string in `out_col` (empty string if an
+    id has no rows in `pairs` at all)."""
+    if len(pairs):
+        grouped = (
+            pairs.groupby(id_col)[cand_col]
+            .apply(lambda ids: ",".join(sorted(set(ids))))
+            .rename(out_col)
+            .reset_index()
+        )
+    else:
+        grouped = pd.DataFrame(columns=[id_col, out_col])
+
+    all_ids_df = pd.DataFrame({id_col: pd.unique(pd.Series(list(all_entity_ids)))})
+    result = all_ids_df.merge(grouped, on=id_col, how="left")
+    result[out_col] = result[out_col].fillna("")
+    return result.drop_duplicates(subset=id_col).reset_index(drop=True)
+
+
+def to_submission_format(candidate_pairs: pd.DataFrame, source1: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert generate_candidate_pairs()'s long format (one row per pair) into the
+    competition's required candidate_pairs.tsv format: one row per Source1 entity,
+    `candidate_entity_ids` as every candidate that survived blocking for that entity
+    (deduplicated, sorted, comma-joined) - NOT filtered by any model threshold. This
+    is "the exact candidate set fed into the model before final thresholding" per the
+    problem statement, and matching_results.tsv's matches must be a subset of it.
+    """
+    return group_entity_ids(
+        candidate_pairs, source1["entity_id"].unique(),
+        id_col="source1_entity_id", cand_col="candidate_entity_id", out_col="candidate_entity_ids",
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Diagnostics
 # --------------------------------------------------------------------------- #
 
@@ -383,11 +480,13 @@ def load_sources(
     data_dir: str, split: str = "train"
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
     prefix = split
-    s1 = pd.read_csv(os.path.join(data_dir, f"{prefix}_source1.tsv"), sep="\t")
-    s2 = pd.read_csv(os.path.join(data_dir, f"{prefix}_source2.tsv"), sep="\t")
-    s3 = pd.read_csv(os.path.join(data_dir, f"{prefix}_source3.tsv"), sep="\t")
+    # dtype=str: skips pandas' memory-hungry dtype-inference pass - see
+    # src.data_loader.load_tsv's docstring for why this matters on this dataset.
+    s1 = pd.read_csv(os.path.join(data_dir, f"{prefix}_source1.tsv"), sep="\t", dtype=str)
+    s2 = pd.read_csv(os.path.join(data_dir, f"{prefix}_source2.tsv"), sep="\t", dtype=str)
+    s3 = pd.read_csv(os.path.join(data_dir, f"{prefix}_source3.tsv"), sep="\t", dtype=str)
     gt_path = os.path.join(data_dir, f"{prefix}_ground_truth.tsv")
-    gt = pd.read_csv(gt_path, sep="\t") if os.path.exists(gt_path) else None
+    gt = pd.read_csv(gt_path, sep="\t", dtype=str) if os.path.exists(gt_path) else None
     return s1, s2, s3, gt
 
 
