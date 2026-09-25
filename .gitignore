@@ -27,6 +27,7 @@ data/
 # Models & Checkpoints
 models/
 checkpoints/
+catboost_info/
 *.pth
 *.pt
 *.bin
