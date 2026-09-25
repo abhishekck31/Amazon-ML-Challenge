@@ -1,0 +1,38 @@
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# Datasets (large files > 100MB cannot be pushed to GitHub)
+dataset/
+data/
+*.tsv
+*.csv
+*.parquet
+*.zip
+*.tar.gz
+
+# Models & Checkpoints
+models/
+checkpoints/
+*.pth
+*.pt
+*.bin
+*.onnx
+
+# Environment & IDE
+.env
+.vscode/
+.idea/

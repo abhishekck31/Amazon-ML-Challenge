@@ -1,0 +1,9 @@
+pandas
+numpy
+scikit-learn
+rapidfuzz
+sentence-transformers
+lightgbm
+xgboost
+tqdm
+matplotlib
