@@ -6,6 +6,7 @@ rapidfuzz
 sentence-transformers
 lightgbm
 xgboost
+catboost
 tqdm
 matplotlib
 ipykernel
