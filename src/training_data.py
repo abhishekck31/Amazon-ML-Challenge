@@ -61,6 +61,57 @@ pool). 5:1-8:1 is a more realistic ratio without making the positive class so ra
 that training becomes unstable at this dataset's scale."""
 
 
+def load_candidate_pairs(path: str) -> pd.DataFrame:
+    """
+    Load candidate_pairs.tsv with categorical id columns, dictionary-encoded by Arrow
+    while parsing. At full scale the file is 400M+ rows: pd.read_csv(dtype=str) holds
+    ~25-30GB of Python string objects, and pd.read_csv(dtype="category") still builds
+    those strings before encoding them (it peaked above 48GB before even finishing the
+    load on a 64GB machine). Arrow's dictionary columns never materialize per-row
+    strings, so the result is a few GB of int32 codes plus the unique ids.
+    """
+    import pyarrow as pa
+    import pyarrow.csv as pacsv
+
+    dictionary_type = pa.dictionary(pa.int32(), pa.string())
+    table = pacsv.read_csv(
+        path,
+        parse_options=pacsv.ParseOptions(delimiter="\t"),
+        convert_options=pacsv.ConvertOptions(
+            include_columns=PAIR_ID_COLUMNS,
+            column_types={col: dictionary_type for col in PAIR_ID_COLUMNS},
+        ),
+    )
+    return table.unify_dictionaries().to_pandas()
+
+
+def _as_categorical(series: pd.Series) -> pd.Series:
+    return series if isinstance(series.dtype, pd.CategoricalDtype) else series.astype("category")
+
+
+def _pack_keys(s1_codes: np.ndarray, cand_codes: np.ndarray) -> np.ndarray:
+    keys = s1_codes.astype(np.int64)
+    keys <<= 32
+    keys |= cand_codes.astype(np.int64)
+    return keys
+
+
+def _membership_mask(keys: np.ndarray, true_keys: np.ndarray, chunk_size: int = 50_000_000) -> np.ndarray:
+    """keys-in-true_keys via binary search against the (small) sorted true set, in chunks,
+    so temporaries stay bounded at chunk_size rather than len(keys). np.isin's sort path
+    would concatenate and argsort all 400M+ keys at once."""
+    true_sorted = np.unique(true_keys)
+    mask = np.zeros(len(keys), dtype=bool)
+    if true_sorted.size == 0:
+        return mask
+    for start in range(0, len(keys), chunk_size):
+        chunk = keys[start:start + chunk_size]
+        idx = np.searchsorted(true_sorted, chunk)
+        np.minimum(idx, true_sorted.size - 1, out=idx)
+        mask[start:start + chunk_size] = true_sorted[idx] == chunk
+    return mask
+
+
 def sample_hard_negatives(
     candidate_pairs: pd.DataFrame,
     positive_pairs: pd.DataFrame,
@@ -76,47 +127,63 @@ def sample_hard_negatives(
 
     Sampled per source1 entity, capped at `negatives_per_positive` times that entity's
     positive count (minimum 1), so one entity with a huge block can't flood the
-    negative pool and unbalance the dataset. Fully vectorized: shuffle once, then keep
-    each group's first `quota` rows via groupby().cumcount() - no per-group Python loop.
+    negative pool and unbalance the dataset: shuffle, then keep each entity's first
+    `quota` rows.
+
+    Works on categorical codes and row positions only. At full scale candidate_pairs is
+    400M+ rows; every earlier version that touched it as Python strings or copied the
+    whole frame (a Python set of tuples, a concatenated string key + .isin(), a
+    .loc[~mask].sample(frac=1.0) shuffle) exhausted 64GB. Pass candidate_pairs with
+    categorical id columns (see main()) to avoid holding 400M+ string objects at all;
+    object columns still work but are converted here.
     """
-    # Vectorized membership check via integer-packed keys, instead of a Python-level
-    # `k in set(...)` loop over every candidate pair (which took over an hour and
-    # exhausted 64GB building hundreds of millions of tuple objects) or a naive string
-    # concatenation + .isin() (which still exhausted 64GB, since building the combined
-    # "id1|id2" string column materializes 400M+ new Python string objects on top of
-    # the already-loaded data). factorize() maps each entity_id string to a compact
-    # int32 code once; packing (code1, code2) into a single uint64 - the same technique
-    # src/blocking.py already uses for its own full-scale dedup - lets .isin() run
-    # over plain integer arrays with no large string allocations.
-    s1_codes, _ = pd.factorize(
-        pd.concat([positive_pairs["source1_entity_id"], candidate_pairs["source1_entity_id"]], ignore_index=True)
-    )
-    cand_codes, _ = pd.factorize(
-        pd.concat([positive_pairs["candidate_entity_id"], candidate_pairs["candidate_entity_id"]], ignore_index=True)
-    )
-    n_pos = len(positive_pairs)
+    s1_col = _as_categorical(candidate_pairs["source1_entity_id"])
+    cand_col = _as_categorical(candidate_pairs["candidate_entity_id"])
+    cand_s1 = s1_col.cat.codes.to_numpy()
+    cand_c = cand_col.cat.codes.to_numpy()
 
-    def pack(s1: np.ndarray, cand: np.ndarray) -> np.ndarray:
-        return (s1.astype(np.uint64) << np.uint64(32)) | cand.astype(np.uint64)
+    # Map positives onto the candidates' category codes; -1 = id never appears in any
+    # candidate pair, so that positive can't match (or block-sample) anything.
+    pos_s1 = s1_col.cat.categories.get_indexer(positive_pairs["source1_entity_id"])
+    pos_c = cand_col.cat.categories.get_indexer(positive_pairs["candidate_entity_id"])
+    both_known = (pos_s1 >= 0) & (pos_c >= 0)
 
-    true_pair_keys = pack(s1_codes[:n_pos], cand_codes[:n_pos])
-    candidate_pair_keys = pack(s1_codes[n_pos:], cand_codes[n_pos:])
-    is_positive = np.isin(candidate_pair_keys, true_pair_keys)
-    negative_pool = candidate_pairs.loc[~is_positive].sample(frac=1.0, random_state=random_state)
-    negative_pool = negative_pool.reset_index(drop=True)
+    candidate_keys = _pack_keys(cand_s1, cand_c)
+    is_positive = _membership_mask(candidate_keys, _pack_keys(pos_s1[both_known], pos_c[both_known]))
+    del candidate_keys
 
-    if negative_pool.empty:
-        return negative_pool.reindex(columns=PAIR_ID_COLUMNS + ["label"])
+    neg_positions = np.flatnonzero(~is_positive & (cand_s1 >= 0))
+    del is_positive
+    if neg_positions.size == 0:
+        empty = candidate_pairs.iloc[:0][PAIR_ID_COLUMNS].astype(str)
+        return empty.assign(label=pd.Series(dtype=int))
 
-    rank_within_entity = negative_pool.groupby("source1_entity_id").cumcount()
+    rng = np.random.default_rng(random_state)
+    rng.shuffle(neg_positions)
 
-    n_positives_per_entity = positive_pairs.groupby("source1_entity_id").size()
-    quota = (
-        negative_pool["source1_entity_id"].map(n_positives_per_entity).fillna(1).astype(int)
-        * negatives_per_positive
-    ).clip(lower=negatives_per_positive)
+    # Rank each shuffled negative within its source1 entity: stable-sort by entity code
+    # (keeps the shuffled order inside each entity), then rank = position - group start.
+    neg_codes = cand_s1[neg_positions]
+    order = np.argsort(neg_codes, kind="stable")
+    sorted_codes = neg_codes[order]
+    del neg_codes
 
-    negatives = negative_pool.loc[rank_within_entity.to_numpy() < quota.to_numpy(), PAIR_ID_COLUMNS].copy()
+    n = sorted_codes.size
+    group_start = np.zeros(n, dtype=bool)
+    group_start[0] = True
+    np.not_equal(sorted_codes[1:], sorted_codes[:-1], out=group_start[1:])
+    start_idx = np.flatnonzero(group_start)
+    del group_start
+    rank = np.arange(n, dtype=np.int64)
+    rank -= np.repeat(start_idx, np.diff(np.append(start_idx, n)))
+
+    positives_per_code = np.bincount(pos_s1[pos_s1 >= 0], minlength=len(s1_col.cat.categories))
+    quota_per_code = np.maximum(positives_per_code, 1) * negatives_per_positive
+    keep = rank < quota_per_code[sorted_codes]
+    del rank, sorted_codes
+
+    final_positions = neg_positions[order[keep]]
+    negatives = candidate_pairs.iloc[final_positions][PAIR_ID_COLUMNS].astype(str)
     negatives["label"] = 0
     return negatives.reset_index(drop=True)
 
@@ -280,7 +347,7 @@ def main() -> None:
     s2 = add_clean_columns(load_tsv(os.path.join(args.data_dir, "train_source2.tsv")))
     s3 = add_clean_columns(load_tsv(os.path.join(args.data_dir, "train_source3.tsv")))
     ground_truth = load_tsv(os.path.join(args.data_dir, "train_ground_truth.tsv"))
-    candidate_pairs = pd.read_csv(args.candidate_pairs, sep="\t", dtype=str)
+    candidate_pairs = load_candidate_pairs(args.candidate_pairs)
     print(f"Loaded inputs in {time.time() - t0:.1f}s ({len(candidate_pairs):,} candidate pairs)")
 
     train_pairs, val_pairs = build_training_dataset(

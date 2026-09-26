@@ -37,6 +37,7 @@ from src.blocking import generate_candidate_pairs, group_entity_ids, to_submissi
 from src.data_loader import load_tsv
 from src.features import generate_features, get_feature_matrix
 from src.preprocessing import add_clean_columns
+from src.scoring import score_pairs_chunked
 from src.threshold_search import apply_dual_threshold, load_predict_proba_fn
 
 
@@ -149,7 +150,7 @@ def run_inference(
     model_name: str,
     singleton_threshold: float,
     match_threshold: float,
-    max_block_pairs: int = 200_000,
+    max_block_pairs: int = 50_000,
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -168,14 +169,29 @@ def run_inference(
     if verbose:
         print(f"Generated {len(candidate_pairs):,} candidate pairs in {time.time() - t1:.1f}s")
 
+    t_sub = time.time()
     candidate_pairs_submission = to_submission_format(candidate_pairs, source1)
-
-    t2 = time.time()
-    scored_pairs = score_candidates(candidate_pairs, source1, targets, model_path, model_name)
     if verbose:
-        print(f"Scored candidates in {time.time() - t2:.1f}s")
+        print(f"Built candidate_pairs submission in {time.time() - t_sub:.1f}s", flush=True)
 
-    matching_results = group_predictions(scored_pairs, source1, singleton_threshold, match_threshold)
+    # Chunked + multi-process: the full test candidate pool is hundreds of millions of
+    # pairs, too many to featurize in one single-threaded, all-in-memory pass. Each
+    # chunk holds complete source1 entities, so applying the dual threshold per chunk
+    # is identical to applying it to the whole table; only accepted pairs are kept.
+    t2 = time.time()
+    accepted = score_pairs_chunked(
+        candidate_pairs, source1, targets, load_predict_proba_fn(model_path, model_name),
+        keep_fn=lambda df: apply_dual_threshold(df, singleton_threshold, match_threshold),
+        verbose=verbose,
+    )
+    del candidate_pairs
+    if verbose:
+        print(f"Scored candidates in {time.time() - t2:.1f}s ({len(accepted):,} accepted pairs)", flush=True)
+
+    matching_results = group_entity_ids(
+        accepted, source1["entity_id"].unique(),
+        id_col="source1_entity_id", cand_col="candidate_entity_id", out_col="matched_entity_ids",
+    )
     validate_matching_results(matching_results, candidate_pairs_submission, source1)
 
     if verbose:
@@ -238,7 +254,8 @@ def main() -> None:
                          help="Overrides models/dual_threshold_info.json.")
     parser.add_argument("--match-threshold", type=float, default=None,
                          help="Overrides models/dual_threshold_info.json.")
-    parser.add_argument("--max-block-pairs", type=int, default=200_000)
+    parser.add_argument("--max-block-pairs", type=int, default=50_000,
+                        help="Must match the value the training candidate pool was blocked with.")
     parser.add_argument("--matching-results-output", default="output/matching_results.tsv")
     parser.add_argument("--candidate-pairs-output", default="output/candidate_pairs.tsv")
     args = parser.parse_args()

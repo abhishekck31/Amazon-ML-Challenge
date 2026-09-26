@@ -289,7 +289,7 @@ def build_source_block_indices(df: pd.DataFrame, rules: List[BlockingRule]) -> D
 def _pairs_from_matching_blocks(
     s1_index: Dict[str, np.ndarray],
     target_index: Dict[str, np.ndarray],
-    max_block_pairs: int = 200_000,
+    max_block_pairs: int = 50_000,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     For every block key present on both sides, emit the full cross product of
@@ -328,7 +328,7 @@ def generate_candidate_pairs(
     source1: pd.DataFrame,
     targets: Dict[str, pd.DataFrame],
     rules: Optional[List[BlockingRule]] = None,
-    max_block_pairs: int = 200_000,
+    max_block_pairs: int = 50_000,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """
@@ -545,7 +545,7 @@ def main() -> None:
     parser.add_argument("--split", default="train", choices=["train", "test"],
                          help="File prefix to load (train_*.tsv or test_*.tsv).")
     parser.add_argument("--output", default="output/candidate_pairs.tsv")
-    parser.add_argument("--max-block-pairs", type=int, default=200_000)
+    parser.add_argument("--max-block-pairs", type=int, default=50_000)
     parser.add_argument("--recall-sample", type=int, default=20_000)
     args = parser.parse_args()
 

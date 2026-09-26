@@ -144,7 +144,38 @@ def generate_features(
     cand_ids = candidate_pairs["candidate_entity_id"].to_numpy()
     sources = candidate_pairs["source"].to_numpy()
 
-    n = len(candidate_pairs)
+    empty_record = ("", "", "")
+    left = [s1_lookup.get(s1_id, empty_record) for s1_id in s1_ids]
+    right = [target_lookups[src].get(cand_id, empty_record) for cand_id, src in zip(cand_ids, sources)]
+    pair_features = compute_pair_features(
+        [r[0] for r in left], [r[1] for r in left], [r[2] for r in left],
+        [r[0] for r in right], [r[1] for r in right], [r[2] for r in right],
+        prefix_len=prefix_len,
+    )
+
+    features = pd.DataFrame({
+        "source1_entity_id": s1_ids,
+        "candidate_entity_id": cand_ids,
+        "source": sources,
+        **pair_features,
+    })
+    features = _add_relative_rank_features(features)
+
+    if verbose:
+        print(f"Generated {len(features):,} feature rows in {time.time() - t0:.1f}s")
+
+    return features
+
+
+def compute_pair_features(names1, addrs1, countries1, names2, addrs2, countries2, prefix_len: int = 3):
+    """
+    The per-pair (non entity-relative) features, from aligned sequences of already
+    normalized name/address/country strings for each side of each pair. Returns
+    {column: array} in FEATURE_COLUMNS order. Takes plain strings rather than entity
+    ids so it can run in a worker process without the full source lookup tables
+    (see src.scoring).
+    """
+    n = len(names1)
     token_sort_ratio = np.empty(n, dtype=np.float32)
     token_set_ratio = np.empty(n, dtype=np.float32)
     partial_ratio = np.empty(n, dtype=np.float32)
@@ -166,11 +197,9 @@ def generate_features(
     name_trigram_dice = np.empty(n, dtype=np.float32)
     postal_code_match = np.empty(n, dtype=np.int8)
 
-    empty_record = ("", "", "")
-    for i, (s1_id, cand_id, src) in enumerate(zip(s1_ids, cand_ids, sources)):
-        name1, addr1, country1 = s1_lookup.get(s1_id, empty_record)
-        name2, addr2, country2 = target_lookups[src].get(cand_id, empty_record)
-
+    for i, (name1, addr1, country1, name2, addr2, country2) in enumerate(
+        zip(names1, addrs1, countries1, names2, addrs2, countries2)
+    ):
         token_sort_ratio[i] = fuzz.token_sort_ratio(name1, name2)
         token_set_ratio[i] = fuzz.token_set_ratio(name1, name2)
         partial_ratio[i] = fuzz.partial_ratio(name1, name2)
@@ -198,10 +227,7 @@ def generate_features(
         postal1, postal2 = _postal_code(addr1), _postal_code(addr2)
         postal_code_match[i] = int(postal1 is not None and postal1 == postal2)
 
-    features = pd.DataFrame({
-        "source1_entity_id": s1_ids,
-        "candidate_entity_id": cand_ids,
-        "source": sources,
+    return {
         "token_sort_ratio": token_sort_ratio,
         "token_set_ratio": token_set_ratio,
         "partial_ratio": partial_ratio,
@@ -222,14 +248,7 @@ def generate_features(
         "name_bigram_jaccard": name_bigram_jaccard,
         "name_trigram_dice": name_trigram_dice,
         "postal_code_match": postal_code_match,
-    })
-
-    features = _add_relative_rank_features(features)
-
-    if verbose:
-        print(f"Generated {n:,} feature rows in {time.time() - t0:.1f}s")
-
-    return features
+    }
 
 
 def _add_relative_rank_features(features: pd.DataFrame) -> pd.DataFrame:

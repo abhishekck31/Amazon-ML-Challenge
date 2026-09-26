@@ -25,6 +25,7 @@ import argparse
 import bisect
 import json
 import os
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -285,7 +286,7 @@ def tune_dual_thresholds_from_full_pool(
     ground_truth: pd.DataFrame,
     model_path: str,
     model_name: str,
-    max_block_pairs: int = 200_000,
+    max_block_pairs: int = 50_000,
     singleton_grid: Optional[np.ndarray] = None,
     match_grid: Optional[np.ndarray] = None,
     verbose: bool = True,
@@ -300,21 +301,55 @@ def tune_dual_thresholds_from_full_pool(
     same rows the model fit would overstate the score.
     """
     from src.blocking import generate_candidate_pairs
-    from src.features import generate_features
-    from src.metrics import ground_truth_to_map
     from src.preprocessing import add_clean_columns
 
     source1 = add_clean_columns(source1)
     targets = {label: add_clean_columns(df) for label, df in targets.items()}
     candidate_pairs = generate_candidate_pairs(source1, targets, max_block_pairs=max_block_pairs, verbose=verbose)
-    features = generate_features(candidate_pairs, source1, targets, verbose=verbose)
+    return tune_dual_thresholds_on_entities(
+        candidate_pairs, source1, targets, ground_truth, source1["entity_id"].unique(),
+        load_predict_proba_fn(model_path, model_name), singleton_grid, match_grid, verbose,
+    )
 
-    predict_fn = load_predict_proba_fn(model_path, model_name)
-    features["match_probability"] = predict_fn(get_feature_matrix(features))
 
-    gt_map = ground_truth_to_map(ground_truth)
-    entity_ids = source1["entity_id"].unique()
-    return search_dual_thresholds(features, gt_map, entity_ids, singleton_grid, match_grid)
+def tune_dual_thresholds_on_entities(
+    candidate_pairs: pd.DataFrame,
+    source1: pd.DataFrame,
+    targets: Dict[str, pd.DataFrame],
+    ground_truth: pd.DataFrame,
+    entity_ids: Iterable[str],
+    predict_fn: Callable[[pd.DataFrame], np.ndarray],
+    singleton_grid: Optional[np.ndarray] = None,
+    match_grid: Optional[np.ndarray] = None,
+    verbose: bool = True,
+) -> Tuple[float, float, float, pd.DataFrame]:
+    """
+    Score `candidate_pairs` (already restricted to `entity_ids`' candidate pools) with
+    src.scoring.score_pairs_chunked and grid-search the dual thresholds against
+    `ground_truth` over `entity_ids`. `source1` / targets must already have clean
+    columns.
+
+    Only pairs scoring >= the lowest grid threshold are kept: every (T_singleton,
+    T_match) on the grid is >= that value, so a lower-scoring pair can never be accepted
+    and never decides whether an entity clears the singleton gate. The search result is
+    identical, but it runs on a few million pairs instead of tens of millions.
+    """
+    from src.metrics import ground_truth_to_map
+    from src.scoring import score_pairs_chunked
+
+    singleton_grid = DEFAULT_SINGLETON_GRID if singleton_grid is None else singleton_grid
+    match_grid = DEFAULT_MATCH_GRID if match_grid is None else match_grid
+    min_threshold = float(min(np.min(singleton_grid), np.min(match_grid)))
+
+    scored = score_pairs_chunked(
+        candidate_pairs, source1, targets, predict_fn,
+        keep_fn=lambda df: df.loc[df["match_probability"] >= min_threshold],
+        verbose=verbose,
+    )
+    if verbose:
+        print(f"Searching {len(singleton_grid)}x{len(match_grid)} threshold grid over "
+              f"{len(scored):,} pairs scoring >= {min_threshold:.2f}", flush=True)
+    return search_dual_thresholds(scored, ground_truth_to_map(ground_truth), entity_ids, singleton_grid, match_grid)
 
 
 # --------------------------------------------------------------------------- #
@@ -363,10 +398,19 @@ def _run_single_mode(args) -> None:
 
 
 def _run_dual_mode(args) -> None:
-    """Real leaderboard-metric dual-threshold search against the full candidate pool
-    for a data split, writing models/dual_threshold_info.json for src.inference to use."""
-    from src.data_loader import load_tsv
+    """Real leaderboard-metric dual-threshold search against the full candidate pool of
+    the held-out validation entities (never seen in training), writing
+    models/dual_threshold_info.json for src.inference to use.
 
+    Reuses the blocking run's candidate_pairs.tsv (restricted to validation entities)
+    rather than re-running blocking on a subset: blocking's caps scale with the number
+    of source1 rows, so blocking only the validation slice would produce a different
+    candidate pool than the one the model is actually applied to."""
+    from src.data_loader import load_tsv
+    from src.preprocessing import add_clean_columns
+    from src.training_data import load_candidate_pairs
+
+    t0 = time.time()
     if args.model_path is None:
         info_path = Path(args.models_dir) / "best_model_info.json"
         info = json.loads(info_path.read_text(encoding="utf-8"))
@@ -376,14 +420,24 @@ def _run_dual_mode(args) -> None:
         model_name = args.model_name or Path(model_path).stem
 
     prefix = args.split
-    source1 = load_tsv(os.path.join(args.data_dir, f"{prefix}_source1.tsv"))
-    s2 = load_tsv(os.path.join(args.data_dir, f"{prefix}_source2.tsv"))
-    s3 = load_tsv(os.path.join(args.data_dir, f"{prefix}_source3.tsv"))
+    source1 = add_clean_columns(load_tsv(os.path.join(args.data_dir, f"{prefix}_source1.tsv")))
+    targets = {
+        "S2": add_clean_columns(load_tsv(os.path.join(args.data_dir, f"{prefix}_source2.tsv"))),
+        "S3": add_clean_columns(load_tsv(os.path.join(args.data_dir, f"{prefix}_source3.tsv"))),
+    }
     ground_truth = load_tsv(os.path.join(args.data_dir, f"{prefix}_ground_truth.tsv"))
 
-    best_ts, best_tm, best_score, table = tune_dual_thresholds_from_full_pool(
-        source1, {"S2": s2, "S3": s3}, ground_truth, model_path, model_name,
-        max_block_pairs=args.max_block_pairs,
+    val_entities = pd.read_parquet(args.val_pairs, columns=["source1_entity_id"])["source1_entity_id"].unique()
+    candidate_pairs = load_candidate_pairs(args.candidate_pairs)
+    s1_col = candidate_pairs["source1_entity_id"]
+    in_val = s1_col.cat.categories.isin(val_entities)[s1_col.cat.codes.to_numpy()]
+    candidate_pairs = candidate_pairs.loc[in_val].reset_index(drop=True)
+    print(f"Loaded inputs in {time.time() - t0:.1f}s: {len(val_entities):,} validation entities, "
+          f"{len(candidate_pairs):,} candidate pairs", flush=True)
+
+    best_ts, best_tm, best_score, table = tune_dual_thresholds_on_entities(
+        candidate_pairs, source1, targets, ground_truth, val_entities,
+        load_predict_proba_fn(model_path, model_name),
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -423,7 +477,8 @@ def main() -> None:
     # --mode dual
     parser.add_argument("--data-dir", default="dataset/train")
     parser.add_argument("--split", default="train", choices=["train", "test"])
-    parser.add_argument("--max-block-pairs", type=int, default=200_000)
+    parser.add_argument("--candidate-pairs", default="output/candidate_pairs.tsv",
+                        help="Long-format candidate pairs from the src.blocking run on --split.")
     args = parser.parse_args()
 
     if args.mode == "single":
