@@ -34,8 +34,13 @@ class TestPhoneticRule(unittest.TestCase):
         keys = _key_country_name_phonetic(df)
         self.assertNotEqual(keys.iloc[0], keys.iloc[1])
 
-    def test_registered_in_default_rules(self):
-        self.assertIn("country_name_phonetic", [r.name for r in DEFAULT_RULES])
+    def test_not_registered_in_default_rules(self):
+        # Dropped from DEFAULT_RULES: at full dataset scale it was responsible for
+        # ~56M raw candidate pairs per target source for the narrow transliteration
+        # edge case it targets - see src/blocking.py's DEFAULT_RULES comment. The key
+        # function itself is kept (and tested above) for callers who want it
+        # explicitly, e.g. a smaller/non-full-scale blocking run.
+        self.assertNotIn("country_name_phonetic", [r.name for r in DEFAULT_RULES])
 
     def test_builds_a_valid_block_index(self):
         df = pd.DataFrame({

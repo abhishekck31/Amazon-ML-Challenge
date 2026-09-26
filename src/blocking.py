@@ -185,12 +185,18 @@ def build_numeric_token_index(
     df: pd.DataFrame,
     column: str,
     min_digits: int = 3,
+    max_df_ratio: float = 0.01,
 ) -> Dict[str, np.ndarray]:
     """
     Rule 5: inverted index {number_string: array_of_row_positions} over numeric
     substrings (house numbers, zip codes, ...) with at least `min_digits` digits,
     extracted from `column`. Short numbers (unit numbers, single-digit noise) are
-    skipped since they are far too common to be discriminative.
+    skipped since they are far too common to be discriminative. `max_df_ratio` drops
+    numbers shared by more than that fraction of rows (e.g. a common zip code prefix),
+    same doc-frequency capping build_token_index already applies to name tokens -
+    without it this rule was the single largest uncapped contributor to full-scale
+    candidate-pair blowup (observed: 69-70M raw pairs per source on the full training
+    set, with no ceiling on how common a given digit string could be).
     """
     n = len(df)
     number_lists = df[column].fillna("").str.findall(r"\d+")
@@ -198,6 +204,11 @@ def build_numeric_token_index(
     number_lists.index = np.arange(n)  # row position, reused as-is by explode()
 
     exploded = number_lists.explode().dropna()
+    doc_freq = exploded.value_counts()
+    max_df = max_df_ratio * max(n, 1)
+    keep_numbers = set(doc_freq[doc_freq <= max_df].index)
+    exploded = exploded[exploded.isin(keep_numbers)]
+
     idx = pd.Series(exploded.index.values, index=exploded.values)
     return {k: v.to_numpy(dtype=np.int64) for k, v in idx.groupby(level=0)}
 
@@ -215,31 +226,47 @@ class BlockingRule:
     kwargs: dict = field(default_factory=dict)
 
 
-# max_df_ratio=0.01 on the broad single-key rules below is not optional polish - at
-# full dataset scale (millions of rows), a low-cardinality key like a common first
-# word ("the", "global", ...) forms thousands of individually medium-sized blocks
-# that each pass the max_block_pairs cross-product cap yet sum to tens of millions of
-# low-signal pairs (observed directly: country_name_firstword alone produced 14.2M
-# raw pairs against just Source2 on the full training set before this cap was added).
-# Capping document frequency here prunes those low-value keys before pair generation,
-# which is what actually keeps a full-scale run's memory/time tractable.
-BROAD_KEY_MAX_DF_RATIO = 0.01
+# max_df_ratio on the broad single-key rules below is not optional polish - at full
+# dataset scale (millions of rows), a low-cardinality key like a common first word
+# ("the", "global", ...) forms thousands of individually medium-sized blocks that each
+# pass the max_block_pairs cross-product cap yet sum to tens/hundreds of millions of
+# low-signal pairs. Even at the previous 0.01 (1%) ratio, every broad rule still
+# produced 40-95M raw pairs per target source on the full training set (S1=2.2M,
+# S2/S3=5M+ rows each), pushing total deduped candidates to 635M and exhausting 64GB
+# of RAM before the pipeline could even finish writing output. 0.002 (0.2%) caps a key
+# to ~4-11K matching rows instead of ~22-53K, which is still far more permissive than
+# any real business sharing one exact key needs, but cuts the low-signal long tail that
+# was dominating candidate volume.
+BROAD_KEY_MAX_DF_RATIO = 0.002
 
+# Prefix/token-length knobs below were widened from their original values
+# (name prefix 3->6 chars, address prefix 10->16 chars, min_token_len 3->5) after
+# max_df_ratio tightening (0.01->0.002) proved to have ZERO effect on raw pair counts
+# for every rule, including two that previously had no doc-frequency cap at all -
+# meaning the long tail of medium-sized blocks driving 635M candidate pairs wasn't
+# coming from a few overly-common keys, it was inherent to how coarse these keys are.
+# Widening the key itself spreads rows across a far larger keyspace (e.g. 26^3=17.6K
+# possible 3-char prefixes vs 26^6=308M for 6 chars), shrinking block sizes directly
+# instead of skipping whole blocks outright, which preserves more true-match recall
+# than capping ever could.
+#
+# country_name_initials and country_name_phonetic (rules 6b/6c) are dropped entirely:
+# per their own docstrings they exist to catch rare edge cases (token-reordering,
+# transliteration variants) but were jointly responsible for ~115M of the raw pairs
+# on Source2 alone, a cost wildly disproportionate to the narrow recall they add at
+# this data volume.
 DEFAULT_RULES: List[BlockingRule] = [
-    BlockingRule("country_name_prefix3", "single_key", key_fn=lambda df: _key_country_name_prefix(df, 3),
+    BlockingRule("country_name_prefix6", "single_key", key_fn=lambda df: _key_country_name_prefix(df, 6),
                  kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
     BlockingRule("country_name_firstword", "single_key", key_fn=_key_country_name_firstword,
                  kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
-    BlockingRule("country_address_prefix10", "single_key", key_fn=lambda df: _key_country_address_prefix(df, 10)),
+    BlockingRule("country_address_prefix16", "single_key", key_fn=lambda df: _key_country_address_prefix(df, 16),
+                 kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
     BlockingRule("name_token", "token", column="name_clean",
-                 kwargs={"min_token_len": 3, "max_df_ratio": 0.01}),
+                 kwargs={"min_token_len": 5, "max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
     BlockingRule("address_numeric_token", "numeric_token", column="address_clean",
-                 kwargs={"min_digits": 3}),
+                 kwargs={"min_digits": 3, "max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
     BlockingRule("country_name_lastword", "single_key", key_fn=_key_country_name_lastword,
-                 kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
-    BlockingRule("country_name_initials", "single_key", key_fn=lambda df: _key_country_name_initials(df, 5),
-                 kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
-    BlockingRule("country_name_phonetic", "single_key", key_fn=_key_country_name_phonetic,
                  kwargs={"max_df_ratio": BROAD_KEY_MAX_DF_RATIO}),
 ]
 
