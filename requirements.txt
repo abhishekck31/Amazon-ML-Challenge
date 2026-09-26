@@ -4,11 +4,9 @@ pyarrow
 scikit-learn
 rapidfuzz
 jellyfish
-sentence-transformers
 lightgbm
 xgboost
 catboost
-shap
 tqdm
 matplotlib
 ipykernel
