@@ -79,9 +79,29 @@ def sample_hard_negatives(
     negative pool and unbalance the dataset. Fully vectorized: shuffle once, then keep
     each group's first `quota` rows via groupby().cumcount() - no per-group Python loop.
     """
-    true_pairs = set(zip(positive_pairs["source1_entity_id"], positive_pairs["candidate_entity_id"]))
-    pair_keys = zip(candidate_pairs["source1_entity_id"], candidate_pairs["candidate_entity_id"])
-    is_positive = np.fromiter((k in true_pairs for k in pair_keys), dtype=bool, count=len(candidate_pairs))
+    # Vectorized membership check via integer-packed keys, instead of a Python-level
+    # `k in set(...)` loop over every candidate pair (which took over an hour and
+    # exhausted 64GB building hundreds of millions of tuple objects) or a naive string
+    # concatenation + .isin() (which still exhausted 64GB, since building the combined
+    # "id1|id2" string column materializes 400M+ new Python string objects on top of
+    # the already-loaded data). factorize() maps each entity_id string to a compact
+    # int32 code once; packing (code1, code2) into a single uint64 - the same technique
+    # src/blocking.py already uses for its own full-scale dedup - lets .isin() run
+    # over plain integer arrays with no large string allocations.
+    s1_codes, _ = pd.factorize(
+        pd.concat([positive_pairs["source1_entity_id"], candidate_pairs["source1_entity_id"]], ignore_index=True)
+    )
+    cand_codes, _ = pd.factorize(
+        pd.concat([positive_pairs["candidate_entity_id"], candidate_pairs["candidate_entity_id"]], ignore_index=True)
+    )
+    n_pos = len(positive_pairs)
+
+    def pack(s1: np.ndarray, cand: np.ndarray) -> np.ndarray:
+        return (s1.astype(np.uint64) << np.uint64(32)) | cand.astype(np.uint64)
+
+    true_pair_keys = pack(s1_codes[:n_pos], cand_codes[:n_pos])
+    candidate_pair_keys = pack(s1_codes[n_pos:], cand_codes[n_pos:])
+    is_positive = np.isin(candidate_pair_keys, true_pair_keys)
     negative_pool = candidate_pairs.loc[~is_positive].sample(frac=1.0, random_state=random_state)
     negative_pool = negative_pool.reset_index(drop=True)
 

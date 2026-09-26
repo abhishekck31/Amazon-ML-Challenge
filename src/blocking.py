@@ -500,7 +500,17 @@ def evaluate_blocking_recall(
     exploded = gt.assign(matched_entity_id=gt["matched_entity_ids"].str.split(","))
     exploded = exploded.explode("matched_entity_id")[["source1_entity_id", "matched_entity_id"]].dropna()
 
-    candidate_set = set(zip(candidate_pairs["source1_entity_id"], candidate_pairs["candidate_entity_id"]))
+    # Only the sampled source1 entities can ever produce a hit, so filter candidate_pairs
+    # down to just those before building the lookup set. At full dataset scale
+    # candidate_pairs can be hundreds of millions of rows - materializing a Python set of
+    # every (source1_entity_id, candidate_entity_id) string-tuple in it (the previous
+    # approach) took 50+ minutes and tens of GB of RAM for a sample that only ever needs
+    # to check a few hundred thousand pairs. Restricting to the sampled entities first
+    # keeps the set proportional to sample_size, not to the full candidate table.
+    sampled_ids = set(gt["source1_entity_id"])
+    relevant_pairs = candidate_pairs[candidate_pairs["source1_entity_id"].isin(sampled_ids)]
+
+    candidate_set = set(zip(relevant_pairs["source1_entity_id"], relevant_pairs["candidate_entity_id"]))
     true_pairs = list(zip(exploded["source1_entity_id"], exploded["matched_entity_id"]))
     hits = sum(1 for pair in true_pairs if pair in candidate_set)
 
