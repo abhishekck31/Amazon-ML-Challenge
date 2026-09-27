@@ -345,9 +345,22 @@ def assign(cands: pd.DataFrame, prob: np.ndarray) -> Tuple[np.ndarray, np.ndarra
     return tgt[first], cands["s1"].to_numpy()[first], prob[first]
 
 
-def entity_macro_f05(best_tgt, best_s1, best_prob, owner, true_count, entity_rows, threshold) -> float:
-    """Leaderboard metric over the S1 rows in `entity_rows`, for the assignment at `threshold`."""
-    keep = best_prob >= threshold
+def apply_sole_guard(best_s1: np.ndarray, best_prob: np.ndarray, keep: np.ndarray, sole_threshold, n_s1: int):
+    """Drop the one kept assignment of any S1 entity that would receive exactly one record
+    unless its probability reaches sole_threshold. A wrong lone match turns an entity that
+    should stay empty from F0.5 = 1 into 0, so a lone match needs more confidence."""
+    if sole_threshold is None:
+        return keep
+    counts = np.bincount(best_s1[keep], minlength=n_s1)
+    lone = keep & (counts[best_s1] == 1)
+    return keep & ~(lone & (best_prob < sole_threshold))
+
+
+def entity_macro_f05(best_tgt, best_s1, best_prob, owner, true_count, entity_rows, threshold,
+                     sole_threshold=None) -> float:
+    """Leaderboard metric over the S1 rows in `entity_rows`, for the assignment at `threshold`
+    (and the lone-match guard at `sole_threshold`, if given)."""
+    keep = apply_sole_guard(best_s1, best_prob, best_prob >= threshold, sole_threshold, true_count.size)
     s1a = best_s1[keep]
     correct = owner[best_tgt[keep]] == s1a
     n = true_count.size
@@ -521,17 +534,10 @@ def run_train(args) -> None:
     log(f"saved model to {args.models_dir} ({time.time() - t_start:.0f}s total)")
 
 
-def run_predict(args) -> None:
+def retrieve_and_score(models_dir: str, info: dict, s1: pd.DataFrame, targets: pd.DataFrame):
+    """(cands, blended probability) for every candidate pair, with the saved models."""
     import lightgbm as lgb
 
-    t_start = time.time()
-    info = json.loads((Path(args.models_dir) / "assign_info.json").read_text(encoding="utf-8"))
-    threshold = args.threshold if args.threshold is not None else info["threshold"]
-    booster = lgb.Booster(model_file=str(Path(args.models_dir) / "assign_lgbm.txt"))
-    log(f"model with {booster.num_trees()} trees, threshold {threshold:.2f}")
-
-    s1, targets = load_split(args.data_dir, args.split)
-    log(f"loaded {len(s1):,} S1 / {len(targets):,} targets")
     cands = retrieve(s1, targets, k=info["k"], max_df=info["max_df"], k_name=info.get("k_name", 0),
                      name_max_df=info.get("name_max_df", 0.01), name_channel=info.get("name_channel", "char"))
     # A model trained with an earlier feature set uses its own columns.
@@ -540,20 +546,80 @@ def run_predict(args) -> None:
     lgbm_weight = info.get("lgbm_weight", 1.0)
     predict_fns, weights = [], []
     if lgbm_weight > 0:
+        booster = lgb.Booster(model_file=str(Path(models_dir) / "assign_lgbm.txt"))
         predict_fns.append(booster.predict)
         weights.append(lgbm_weight)
     if lgbm_weight < 1:
         from catboost import CatBoostClassifier
 
-        cat = CatBoostClassifier().load_model(str(Path(args.models_dir) / "assign_catboost.cbm"))
+        cat = CatBoostClassifier().load_model(str(Path(models_dir) / "assign_catboost.cbm"))
         predict_fns.append(lambda x: cat.predict_proba(x)[:, 1])
         weights.append(1 - lgbm_weight)
     probs = score_rows(cands, np.arange(len(cands)), s1, targets, predict_fns, feature_idx=feature_idx)
     prob = sum(w * p for w, p in zip(weights, probs)).astype(np.float32)
-    del probs
     log(f"predicted {len(prob):,} pairs (lgbm weight {lgbm_weight:.2f}) in {time.time() - t0:.0f}s")
+    return cands, prob
+
+
+def run_tune_guard(args) -> None:
+    """Re-score the training set with saved models and grid-search (threshold, sole_threshold)
+    on the held-out S1 entities; writes both into assign_info.json (old file kept)."""
+    t_start = time.time()
+    info_path = Path(args.models_dir) / "assign_info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    s1, targets = load_split(args.data_dir, "train")
+    owner, true_count = owner_index(load_tsv(os.path.join(args.data_dir, "train_ground_truth.tsv")), s1, targets)
+    log(f"loaded {len(s1):,} S1 / {len(targets):,} targets")
+    cands, prob = retrieve_and_score(args.models_dir, info, s1, targets)
+    best_tgt, best_s1, best_prob = assign(cands, prob)
+    del cands, prob
+
+    # Same held-out entities as run_train (its first draw from the same seed).
+    val_entity = np.random.default_rng(args.seed).random(len(s1)) < args.val_frac
+    val_rows = np.flatnonzero(val_entity)
+    # Assignments to other entities cannot change a held-out entity's score.
+    v = val_entity[best_s1]
+    bt, bs, bp = best_tgt[v], best_s1[v], best_prob[v]
+    np.savez_compressed(Path(args.models_dir) / "val_assignments.npz", tgt=bt, s1=bs, prob=bp)
+
+    base_t = info["threshold"]
+    base = entity_macro_f05(bt, bs, bp, owner, true_count, val_rows, base_t)
+    log(f"reproduced validation F0.5 {base:.5f} at threshold {base_t:.2f} "
+        f"(training run reported {info['validation_entity_macro_f0.5']:.5f})")
+    results = []
+    for t in np.round(np.arange(0.45, 0.81, 0.01), 2):
+        for ts in np.round(np.arange(t, 1.0, 0.01), 2):
+            results.append((entity_macro_f05(bt, bs, bp, owner, true_count, val_rows, t, ts), t, ts))
+    results.sort(reverse=True)
+    for score, t, ts in results[:8]:
+        log(f"  threshold {t:.2f}, lone-match threshold {ts:.2f}: F0.5 {score:.5f}")
+    best_score, best_t, best_ts = results[0]
+    gain = best_score - base
+    log(f"best: threshold {best_t:.2f}, lone-match threshold {best_ts:.2f} -> {best_score:.5f} ({gain:+.5f})")
+
+    (Path(args.models_dir) / "assign_info_before_guard.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    info.update({
+        "threshold": float(best_t), "sole_threshold": float(best_ts), "country_thresholds": {},
+        "validation_entity_macro_f0.5_before_guard": base, "validation_entity_macro_f0.5": best_score,
+    })
+    info_path.write_text(json.dumps(info, indent=2), encoding="utf-8")
+    log(f"updated {info_path} ({time.time() - t_start:.0f}s total)")
+
+
+def run_predict(args) -> None:
+    t_start = time.time()
+    info = json.loads((Path(args.models_dir) / "assign_info.json").read_text(encoding="utf-8"))
+    threshold = args.threshold if args.threshold is not None else info["threshold"]
+    sole_threshold = None if args.threshold is not None else info.get("sole_threshold")
+    log(f"threshold {threshold:.2f}, lone-match threshold {sole_threshold}")
+
+    s1, targets = load_split(args.data_dir, args.split)
+    log(f"loaded {len(s1):,} S1 / {len(targets):,} targets")
+    cands, prob = retrieve_and_score(args.models_dir, info, s1, targets)
 
     best_tgt, best_s1, best_prob = assign(cands, prob)
+    os.makedirs(args.output_dir, exist_ok=True)
+    np.savez_compressed(Path(args.output_dir) / "assignments.npz", tgt=best_tgt, s1=best_s1, prob=best_prob)
     # Per-country thresholds unless overridden; countries unseen in training use the global one.
     country_thresholds = {} if args.threshold is not None else info.get("country_thresholds", {})
     s1_country = s1["country"].fillna("").to_numpy()
@@ -563,10 +629,12 @@ def run_predict(args) -> None:
     log("thresholds: " + ", ".join(f"{c} {t:.2f}" for c, t in country_thresholds.items())
         + f", other {threshold:.2f}")
     keep = best_prob >= pair_threshold
+    guarded = apply_sole_guard(best_s1, best_prob, keep, sole_threshold, len(s1))
+    log(f"lone-match guard dropped {int(keep.sum() - guarded.sum()):,} assignments")
+    keep = guarded
     matching = grouped_ids(best_s1[keep], best_tgt[keep], s1, targets, "matched_entity_ids")
     candidates = grouped_ids(cands["s1"].to_numpy(), cands["tgt"].to_numpy(), s1, targets, "candidate_entity_ids")
 
-    os.makedirs(args.output_dir, exist_ok=True)
     candidates.to_csv(Path(args.output_dir) / "candidate_pairs.tsv", sep="\t", index=False)
     matching.to_csv(Path(args.output_dir) / "matching_results.tsv", sep="\t", index=False)
     n_matched = int((matching["matched_entity_ids"] != "").sum())
@@ -600,10 +668,17 @@ def main() -> None:
     predict.add_argument("--split", default="test", choices=["train", "test"])
     predict.add_argument("--models-dir", default="models_v2")
     predict.add_argument("--output-dir", default="output")
-    predict.add_argument("--threshold", type=float, default=None, help="Overrides assign_info.json.")
+    predict.add_argument("--threshold", type=float, default=None,
+                         help="Overrides assign_info.json (and disables the lone-match guard).")
+
+    guard = sub.add_parser("tune-guard", help="Tune threshold + lone-match threshold for saved models.")
+    guard.add_argument("--data-dir", default="dataset/train")
+    guard.add_argument("--models-dir", required=True)
+    guard.add_argument("--val-frac", type=float, default=0.2, help="Must match the training run.")
+    guard.add_argument("--seed", type=int, default=42, help="Must match the training run.")
 
     args = parser.parse_args()
-    run_train(args) if args.command == "train" else run_predict(args)
+    {"train": run_train, "predict": run_predict, "tune-guard": run_tune_guard}[args.command](args)
 
 
 if __name__ == "__main__":
