@@ -1,185 +1,170 @@
 # Business Entity Resolution — Methodology Write-Up
-**Amazon ML Challenge 2026**
+**Amazon ML Challenge 2026 · Team Runtime Rebels**
+
+Final submission: **v4**, leaderboard entity-level macro F0.5 **0.915**
+(held-out validation 0.939). Code: `src/assign_pipeline.py` (+ `src/preprocessing.py`,
+`src/features.py`).
 
 ---
 
 ## 1. Executive Summary & Problem Formulation
 
-The task is entity resolution across three heterogeneous business-record sources.
-Source1 is the deduplicated reference set; each Source1 entity has **zero** (a
-singleton), **one**, or **multiple** true matches in Source2/Source3. Predictions are
-scored with **entity-level macro F0.5** — F0.5 is computed independently for every
-Source1 entity by comparing its predicted match set against its true match set, then
-averaged across all entities (not a row-level metric over flattened pairs — see
-Section 5). Because a singleton scores 1.0 for an empty prediction and 0.0 for even
-one false positive, precision on low-confidence entities matters far more than raw
-recall, which shapes the entire downstream design: high-recall blocking, precision-
-weighted features, and a threshold rule built specifically to protect singletons.
+Source1 is the deduplicated reference set; each Source1 (S1) entity has zero, one or
+several true matches in Source2/Source3. The score is **entity-level macro F0.5**:
+F0.5 per S1 entity between its predicted and true match sets, averaged over all S1
+entities (an entity with no true matches scores 1 only for an empty prediction).
 
-The pipeline is implemented as a modular `src/` package: `preprocessing.py` →
-`blocking.py` → `features.py` → `training_data.py` → `train.py` →
-`threshold_search.py` → `inference.py`, each independently testable (60 unit tests)
-and independently runnable via CLI.
+The decisive observation, from the training ground truth: **every S2/S3 record belongs
+to at most one S1 entity** (0 of the 7.64M matched records has two owners) and ~27% of
+S2/S3 records have no owner at all. So instead of scoring S1 → candidate pairs
+independently, the final pipeline is **target-centric**: for every S2/S3 record it asks
+*"which single S1 entity owns this record, if any?"* This turned a pairwise
+classification problem into a per-record assignment problem and was the largest single
+gain (0.744 → 0.888 on the leaderboard).
+
+| Version | Change | Validation | Leaderboard |
+|---|---|---|---|
+| v1 | rule blocking → pairwise GBDT → dual threshold | 0.745 | 0.744 |
+| v2 | target-centric TF-IDF retrieval + assignment; anyascii transliteration | 0.914 | 0.888 |
+| v3 | candidate-relative features, LightGBM + CatBoost blend | 0.922 | 0.895 |
+| **v4** | second (name) retrieval channel, phonetic skeleton features, zero-padding fix | **0.939** | **0.915** |
 
 ---
 
-## 2. Candidate Generation (Blocking) Strategy
+## 2. Candidate Generation (Retrieval)
 
-Naive matching is O(|Source1| × |Source2 ∪ Source3|), which is intractable at this
-dataset's scale. `src/blocking.py` instead builds a multi-index inverted-blocking
-pipeline: every record is hashed under several cheap keys, and only records sharing
-at least one key are ever compared.
+Per country (retrieval never crosses countries), `retrieve()` runs two TF-IDF channels
+with sparse top-k matrix products (`sparse_dot_topn`):
 
-**Rules** (each an independent recall channel, unioned and deduplicated):
-1. Country + first 3 characters of the cleaned name
-2. Country + first word of the cleaned name
-3. Country + prefix of the cleaned address
-4. Token-based inverted index over name tokens (rare-token filtered)
-5. Numeric-token overlap on addresses (house/unit numbers)
-6. Country + last word of the cleaned name (catches prefix drift, e.g. "St"/"Saint")
-7. Country + sorted token-initials acronym (catches word reordering)
-8. Country + Metaphone phonetic code of the first name token (catches transliteration
-   variants, e.g. "Kumar" vs. "Coomar" — common in Indian business names)
+1. **Combined channel** — word TF-IDF over `name_clean + address_clean`
+   (sublinear tf, tokens in more than 5,000 S1 records dropped); top **10** S1 records
+   per S2/S3 record by cosine.
+2. **Name channel** — character 3–5-gram (`char_wb`) TF-IDF over `name_clean` alone
+   (min_df 2, max_df 1% of S1); top **10**. It catches owners whose address text
+   diluted the combined cosine.
 
-**Capped document frequency** (`BROAD_KEY_MAX_DF_RATIO = 0.01`, plus per-rule
-`max_df_ratio` on the name-token rule) drops any block key shared by more than 1% of
-rows before pair generation. This is not a minor tuning knob: at full dataset scale a
-single common key (e.g. a generic first word) forms thousands of individually
-medium-sized blocks that each pass a per-block size cap yet sum to tens of millions of
-low-value pairs — confirmed directly during a full-scale run, where one unguarded rule
-alone produced 14.2M raw pairs against Source2. Capping frequency before pair
-generation, combined with a hard per-block cross-product cap (`max_block_pairs`), is
-what keeps both memory and candidate volume tractable.
+The two lists are unioned (~18.8 candidates per record, 194M training pairs) and every
+candidate receives **both** cosines (the channel that did not retrieve it is computed
+exactly for that pair).
 
-**Measured on held-out validation samples:** recall ≈ 96.4–96.7%, reduction ratio
-≈ 99.3–99.6% versus the full cross product. (Full-dataset-scale numbers are pending a
-higher-memory environment than local development allowed — see Section 8.)
+**Measured owner recall** (share of matched S2/S3 records whose true owner is among
+their candidates, full training set): combined channel alone 92.8%, name channel alone
+63.1%, **union 95.3%** (v1 rule-based blocking reached ~70% with ~200 candidates per S1).
+With a perfect classifier this retrieval caps validation macro F0.5 at 0.981.
+
+Retrieval-miss analysis drove two preprocessing fixes (`src/preprocessing.py`):
+- **Transliteration** with `anyascii` instead of NFKD + ASCII-drop, which had deleted
+  Devanagari/Bengali/Telugu/Tamil/Odia/Kannada names outright.
+- **Zero-padded numbers** normalised (`House No-008` → `8`, `A-0060` → `60`).
+
+Widening further was measured and rejected: 20 + 20 candidates reach only 96.0% recall
+at twice the pairs; the residual misses are generic names ("Smart Enterprises") whose
+counterpart has a heavily truncated address.
 
 ---
 
 ## 3. Feature Engineering
 
-`src/features.py` computes **23 features** per candidate pair from `name_clean` /
-`address_clean` (all RapidFuzz scoring is C-accelerated; no `iterrows()` anywhere):
+44 features per (S2/S3 record, S1 candidate), `feature_matrix()`:
 
-- **Name similarity (6):** `token_sort_ratio`, `token_set_ratio`, `partial_ratio`,
-  `ratio`, `WRatio`, Jaro-Winkler
-- **Address similarity (4):** token-sort ratio, partial ratio, Jaro-Winkler,
-  longest-common-subsequence ratio
-- **Structural (6):** exact country match, first-word match, prefix match, name/address
-  length difference, numeric-token Jaccard overlap
-- **Character n-gram (2):** 2-gram Jaccard, 3-gram Dice coefficient on names
-- **Address-specific (1):** postal/PIN code exact match (5–6 digit trailing numeric
-  token — country-agnostic by construction, never branches on country)
-- **Group-relative ranking (3):** `rank_within_entity`, `is_top1_for_entity`,
-  `score_margin_to_next` — a candidate's standing *among all candidates blocked for
-  the same Source1 entity*, computed via vectorized `groupby` rank/transform. This
-  lets the model use competitive context (e.g. "clearly the best of 40 candidates" vs.
-  "similar in isolation but barely ahead of a rival") that pairwise features alone
-  cannot express.
+- **Retrieval (15):** combined cosine, its rank / gap to the record's best / margin to
+  the next candidate, number of candidates; how many records ranked this S1 first or
+  retrieved it at all, where this record ranks among all records that retrieved the
+  same S1 (`s1_reverse_rank`) and its cosine gap to that S1's best record; name-channel
+  cosine, rank and gap; which channel(s) retrieved the pair (`both_channels_retrieved`).
+- **String similarity (20, `src/features.py::compute_pair_features`):** RapidFuzz
+  token-sort/set, partial, ratio, WRatio, Jaro-Winkler on names; token, partial,
+  Jaro-Winkler, LCS on addresses; country/first-word/prefix match, length differences,
+  numeric-token overlap, token Jaccard, name 2-gram Jaccard / 3-gram Dice, postal-code
+  match. Computed in a fork process pool over 1M-pair chunks.
+- **Phonetic skeleton (2):** RapidFuzz token-set ratio and ratio between *consonant
+  skeletons* of the two names — aspirates folded, soft c/g folded, similar consonants
+  merged (t/d, p/f, k/g/c, s/z/j, m/n, b/v/w), vowels dropped, transliterated legal
+  forms removed. An English name and its Indian-script transliteration then collide:
+  "Southern Projects" / "सदर्न प्रोजेक्ट्स" → `strn prskts`; "Sky Trading" /
+  "स्काई ट्रेडिंग" → `sk trtnk`.
+- **Candidate-relative (7):** for the key similarities, the gap to the best value among
+  the same record's candidates. Assignment picks one owner among ~19 candidates, so how
+  a candidate compares with its competitors matters as much as its absolute similarity.
+  `skel_token_set_ratio_gap_to_best` is the single most important v4 feature (22% of
+  LightGBM gain).
 
 ---
 
 ## 4. Model Architecture & Training
 
-`src/training_data.py` builds a **6:1 hard-negative-to-positive** labeled set:
-positives from ground truth, negatives sampled from candidate pairs that passed
-blocking but are not true matches (far more informative than random pairs, since
-blocking would never propose a genuinely dissimilar pair). The 1:1 ratio tried
-earlier taught the model to over-predict matches; 6:1 better reflects the true
-class imbalance without starving the positive class at this dataset's scale.
-
-The train/validation split is **entity-level** (never split by individual pair, to
-avoid leakage) and **stratified** by (match-count bucket: singleton / single-match /
-multi-match) × country, so local CV mirrors the true Source1 population rather than
-an arbitrary random draw — important with only 5 submissions/day.
-
-`src/train.py` trains four candidates: **Logistic Regression** (standardized,
-class-balanced baseline), **LightGBM**, **XGBoost**, and **CatBoost**, each with
-early stopping on the validation set, plus a fifth: an **ensemble** that
-probability-averages the three GBDT models. All five compete on equal footing for
-best-model selection; the ensemble does not automatically win (observed: it slightly
-underperformed solo CatBoost in one run), so selection is always validated against
-the real entity-level metric (Section 5), never the diagnostic alone.
+- **Split:** 20% of S1 entities held out for validation (entity-level, so no entity's
+  records leak across the split); training uses a 30% sample of S2/S3 records with all
+  of their candidates (46.6M pairs, 3.8% positive), so candidate-relative features
+  are exact.
+- **Models:** LightGBM (255 leaves, lr 0.05, early stopping → 221 trees) and CatBoost
+  (depth 8, lr 0.15, 1,500 trees), both early-stopped on a held-out slice of
+  validation-entity pairs.
+- **Blend:** probabilities blended as `w·LightGBM + (1−w)·CatBoost`, with `w` chosen on
+  held-out entities by the real metric: w = 1.00 → 0.9363, 0.75 → 0.9376,
+  0.50 → 0.9386, **0.25 → 0.9390**, 0.00 → 0.9390.
+- **Memory:** features for the non-sampled 136M pairs are computed and scored in
+  target-aligned 15M-row chunks, so the full feature matrix is never materialised
+  (peak 57 GB on a 61 GB instance).
 
 ---
 
-## 5. The Dual-Threshold Strategy
+## 5. Assignment & Threshold
 
-**Entity-level Macro F0.5** (the actual competition metric — `src/metrics.py`):
+Each S2/S3 record is assigned to its **single highest-probability S1 candidate** if that
+probability clears a threshold, otherwise to nobody. This enforces the one-owner
+structure exactly and makes singleton protection implicit: an S1 entity is predicted
+empty unless some record chooses it.
+
+The threshold is grid-searched (0.05–0.95, step 0.01) directly against entity-level
+macro F0.5 on the held-out S1 entities, using a vectorised implementation of the metric:
 
 ```
-For Source1 entity i with true match set T_i and predicted match set P_i:
-
-  F0.5(P_i, T_i) = 1.0                                     if T_i = P_i = empty
-                 = 0.0                                     if exactly one of T_i, P_i is empty
-                 = 1.25 * Prec_i * Rec_i / (0.25*Prec_i + Rec_i)   otherwise
-
-  where Prec_i = |T_i ∩ P_i| / |P_i|,  Rec_i = |T_i ∩ P_i| / |T_i|
-
-  Score = (1 / |Source1|) * sum_i F0.5(P_i, T_i)
+F0.5_i = 1                              if T_i = P_i = ∅
+       = 0                              if exactly one of T_i, P_i is empty
+       = 1.25·Prec_i·Rec_i / (0.25·Prec_i + Rec_i)   otherwise
+Score  = mean over all S1 entities
 ```
 
-This is deliberately **not** `sklearn.fbeta_score(average="macro")` run on flattened
-pairs — that averages over the match/non-match *classes*, a different number
-entirely. Confusing the two was an early bug in this project; fixing it changed the
-measured score materially (a pair-level proxy showed ~0.997 on a validation slice,
-while the correct entity-level metric on the same model showed ~0.94–0.96).
-
-**Decision rule**, for each Source1 entity's candidate probabilities {p₁, ..., pₖ}:
-- If `max(p) < T_singleton`: predict the empty set (protects the 1.0 singleton score)
-- Else: accept every candidate with `p ≥ T_match` (`T_match ≥ T_singleton`)
-
-`src/threshold_search.py::search_dual_thresholds` grid-searches `(T_singleton,
-T_match)` directly against entity-level macro F0.5 on the **full candidate pool**
-(never the class-balanced training sample, whose precision numbers do not reflect the
-real, heavily-imbalanced candidate distribution), using a precomputed sorted/bisect
-structure per entity for speed. `src/inference.py` applies the resulting thresholds
-and writes `matching_results.tsv` (subset of) `candidate_pairs.tsv`, both validated by
-`utils/validate_submission.py` before packaging.
+Chosen: **0.63** (India 0.61, US 0.63 when tuned per country — each country's entities
+depend only on that country's assignments, so per-country tuning is exact; it changed
+the score by < 0.001). Validation by country: US 0.949, India 0.924.
 
 ---
 
-## 6. Zero-Shot Out-of-Domain Generalization (France)
+## 6. Zero-Shot Generalization (France)
 
-Training data contains only US and India; the test set introduces France. Country is
-never hardcoded, filtered, or branched on anywhere in the pipeline — generalization
-comes entirely from text normalization in `src/preprocessing.py`:
-
-- **Unicode NFKD accent normalization**: `Société` → `societe`, `Café` → `cafe`,
-  applied *before* the ASCII-only punctuation regex (which would otherwise silently
-  delete accented characters instead of folding them).
-- **French legal-entity suffixes** added alongside the original set: SARL, SAS,
-  SASU, SA, EURL, SCI, SNC, GIE, CIE, Association, GmbH.
-- **Street-designator synonyms** (`rd`→road, `ave`→avenue, `blvd`/`bd`→boulevard,
-  `rte`→route, `chem`→chemin) so equivalent addresses block/match regardless of
-  abbreviation — deliberately excluding "st" (Street vs. Saint is genuinely
-  ambiguous; guessing wrong would corrupt real content).
-
-Verified against real French rows from `test_source1.tsv` (e.g. `ZNB Club SARL` →
-`znb club`, `Maison de Santé Generation` → `maison de sante generation`).
+Training contains only US and India; the test set adds France (15% of test S1). Nothing
+branches on country except that retrieval and TF-IDF vocabularies are built per
+country, which adapts automatically to French vocabulary and word frequencies.
+`anyascii` folds accents (`Société` → `societe`), French legal forms (SARL, SAS, SASU,
+EURL, SCI, SNC, GIE, …) are stripped, and French street abbreviations (`bd`, `chem`) are
+expanded. France uses the global threshold. Its test behaviour is in line with the
+labelled countries (in the v2 output, 5.1% of French S1 entities were predicted empty
+vs 5.6% empty in the training ground truth). The consistent ~0.025 gap between validation and leaderboard
+across v2–v4 is attributed to France (no labels) and the test set's heavier India
+share.
 
 ---
 
 ## 7. Academic Integrity & Fair Play Statement
 
-This solution uses **no external API calls, geocoding services, internet lookups, or
-external databases** of any kind. All matching signal is derived exclusively from the
-three provided source files (business name, address, country) using open-source
-libraries (pandas, RapidFuzz, jellyfish, scikit-learn, LightGBM, XGBoost, CatBoost),
-all MIT/BSD/Apache-2.0 licensed, none exceeding the parameter-count limit (the GBDT
-models are not parameter-counted neural networks; no pretrained model of any kind is
-loaded from the network). Every transformation is deterministic and reproducible from
-`requirements.txt` and the `src/` pipeline alone.
+No external APIs, geocoding, internet lookups or external data. All signal comes from
+the three provided files (name, address, country) via open-source libraries (pandas,
+numpy, scikit-learn, sparse_dot_topn, RapidFuzz, anyascii, LightGBM, CatBoost; MIT/BSD/
+Apache-2.0). No pretrained or neural models. We checked the data for construction
+artefacts (row order, ID numbering vs owner) and found none; no identifier-based
+shortcuts are used. Every step is deterministic given the seed and reproducible from
+`requirements.txt` and `src/`.
 
 ---
 
 ## 8. Known Limitations / Next Steps
 
-Local development happened on a memory-constrained machine (~1–2GB free RAM), which
-bounded end-to-end validation to representative held-out samples rather than the full
-2.2M/5M/5.3M-row dataset. The `dtype=str` fix in `src/data_loader.py` and the
-`max_df_ratio` blocking fix in `src/blocking.py` were specifically added to make a
-full-scale run tractable; both are unit-tested and validated on samples, with a
-full-scale confirmation pending a higher-memory environment (e.g. the AWS EC2 instance
-provisioned via `setup_ec2.sh`).
+- **Retrieval ceiling:** 95.3% owner recall caps validation F0.5 at 0.981; wider
+  character/word channels plateau near 96%. A retrieval model trained on the ground
+  truth (e.g. learned token weights) is the most promising next step.
+- **Classifier gap:** 0.939 vs the 0.981 ceiling; more training data was limited by the
+  61 GB instance (features for 30% of records).
+- **France** cannot be validated without labels.
+- Training + test prediction take ~3.7 h on an 8-vCPU / 61 GB EC2 instance.

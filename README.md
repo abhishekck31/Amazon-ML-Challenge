@@ -100,8 +100,9 @@ Core libraries installed:
 - `pandas`, `numpy`: High-performance data manipulation
 - `scikit-learn`: Metrics, evaluation, cross-validation, and baseline models
 - `rapidfuzz`: High-speed string similarity and token matching
-- `sentence-transformers`: Dense neural semantic representations
-- `lightgbm`, `xgboost`: Gradient boosting frameworks
+- `anyascii`: Transliteration of non-Latin scripts (Devanagari, Bengali, Tamil, ...)
+- `sparse_dot_topn`: Fast top-k sparse TF-IDF retrieval
+- `lightgbm`, `catboost`, `xgboost`: Gradient boosting frameworks
 - `tqdm`, `matplotlib`: Progress tracking and data visualization
 - `ipykernel`: Jupyter notebook kernel integration
 
@@ -135,6 +136,28 @@ Because competition dataset files are large (> 500 MB) and excluded from Git tra
    - `dataset/test/test_source1.tsv`
    - `dataset/test/test_source2.tsv`
    - `dataset/test/test_source3.tsv`
+
+---
+
+## 🏁 Reproducing the Final Submission (v4)
+
+The submitted results come from `src/assign_pipeline.py` (methodology in
+`Documentation_template.md`). It needs roughly 60 GB of RAM; we used an 8-vCPU / 61 GB
+EC2 instance (~2.6 h training, ~1.1 h test prediction).
+
+```bash
+# Train LightGBM + CatBoost, tune blend weight and threshold on held-out S1 entities
+python -u -m src.assign_pipeline train --data-dir dataset/train --models-dir models_v4 \
+    --k 10 --k-name 10 --name-channel char --learning-rate 0.05 --num-boost-round 2000 \
+    --train-target-frac 0.3
+
+# Retrieve, score and assign the test set -> output_v4/matching_results.tsv, candidate_pairs.tsv
+python -u -m src.assign_pipeline predict --data-dir dataset/test --models-dir models_v4 --output-dir output_v4
+
+# Check the output format
+python utils/validate_submission.py --matching-results output_v4/matching_results.tsv \
+    --candidate-pairs output_v4/candidate_pairs.tsv --source1 dataset/test/test_source1.tsv
+```
 
 ---
 
