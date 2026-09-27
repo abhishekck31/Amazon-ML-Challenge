@@ -4,6 +4,8 @@ pyarrow
 scikit-learn
 rapidfuzz
 jellyfish
+anyascii
+sparse_dot_topn
 lightgbm
 xgboost
 catboost

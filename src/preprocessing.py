@@ -25,9 +25,9 @@ generalizes to that unseen country instead of silently breaking on it:
 from __future__ import annotations
 
 import re
-import unicodedata
 
 import pandas as pd
+from anyascii import anyascii
 
 # Legal-entity suffixes to strip from business names. Matched as whole words after
 # punctuation has already been stripped, so "Pvt." / "Pvt," / "(Pvt)" all collapse to
@@ -69,22 +69,16 @@ _STREET_SYNONYM_RE = re.compile(STREET_SYNONYM_PATTERN)
 
 
 def strip_accents(text: str) -> str:
-    """Unicode NFKD-decompose and drop combining diacritical marks: 'Société' -> 'Societe',
-    'Café' -> 'Cafe'. Case-preserving; run before lowercasing (order doesn't matter, but
-    this module always does it first for clarity)."""
-    decomposed = unicodedata.normalize("NFKD", text)
-    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    """Transliterate to ASCII: 'Société' -> 'Societe', and non-Latin scripts to their Latin
+    reading ('डिजिटल इंफोटेक' -> 'dijitl imphotek'). Source 2/3 names are often written in
+    Devanagari, Kannada, Telugu or Gujarati script; the previous NFKD + ASCII-drop approach
+    deleted those characters outright, leaving an empty name."""
+    return anyascii(text)
 
 
 def strip_accents_series(s: pd.Series) -> pd.Series:
-    """Vectorized strip_accents over a whole column, via pandas' str.normalize (wraps
-    unicodedata.normalize) + an ASCII round-trip to drop the now-isolated combining marks."""
-    return (
-        s.fillna("").astype(str)
-        .str.normalize("NFKD")
-        .str.encode("ascii", errors="ignore")
-        .str.decode("ascii")
-    )
+    """strip_accents over a whole column (missing values become "")."""
+    return s.fillna("").astype(str).map(anyascii)
 
 
 def normalize_text(value, remove_legal_suffixes: bool = False, expand_street_synonyms: bool = False) -> str:

@@ -435,9 +435,13 @@ def _run_dual_mode(args) -> None:
     print(f"Loaded inputs in {time.time() - t0:.1f}s: {len(val_entities):,} validation entities, "
           f"{len(candidate_pairs):,} candidate pairs", flush=True)
 
+    def parse_grid(value):
+        return None if value is None else np.array(sorted(float(v) for v in value.split(",")))
+
     best_ts, best_tm, best_score, table = tune_dual_thresholds_on_entities(
         candidate_pairs, source1, targets, ground_truth, val_entities,
         load_predict_proba_fn(model_path, model_name),
+        singleton_grid=parse_grid(args.singleton_grid), match_grid=parse_grid(args.match_grid),
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -479,6 +483,10 @@ def main() -> None:
     parser.add_argument("--split", default="train", choices=["train", "test"])
     parser.add_argument("--candidate-pairs", default="output/candidate_pairs.tsv",
                         help="Long-format candidate pairs from the src.blocking run on --split.")
+    parser.add_argument("--singleton-grid", default=None,
+                        help="Comma-separated T_singleton values (default: 0.30..0.95, 14 steps).")
+    parser.add_argument("--match-grid", default=None,
+                        help="Comma-separated T_match values (default: 0.30..0.95, 14 steps).")
     args = parser.parse_args()
 
     if args.mode == "single":
