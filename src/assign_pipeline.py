@@ -44,12 +44,14 @@ import pandas as pd
 
 from src.data_loader import load_tsv
 from src.features import FEATURE_COLUMNS, compute_pair_features
-from src.preprocessing import add_clean_columns
+from src.preprocessing import add_clean_columns, name_skeleton_series
 
 K = 10
 MAX_DF = 5000
 K_NAME = 10
 STRING_FEATURES = FEATURE_COLUMNS[:20]
+# Similarity of the phonetic name skeletons, which survive transliteration from Indian scripts.
+SKELETON_FEATURES = ["skel_token_set_ratio", "skel_ratio"]
 RETRIEVAL_FEATURES = ["cos", "rank", "gap_to_top1", "margin_to_next", "n_cands", "s1_top1_count", "s1_cand_count",
                       "s1_reverse_rank", "s1_best_cos_gap",
                       "cos_name", "name_rank", "name_gap_to_top1",
@@ -57,9 +59,10 @@ RETRIEVAL_FEATURES = ["cos", "rank", "gap_to_top1", "margin_to_next", "n_cands",
 # Assignment picks the best of a target's K candidates, so how a candidate compares to its
 # competitors matters as much as its absolute similarity.
 RELATIVE_BASE = ["name_jaro_winkler", "token_sort_ratio", "name_bigram_jaccard",
-                 "address_token_similarity", "address_partial_similarity", "address_lcs_ratio"]
+                 "address_token_similarity", "address_partial_similarity", "address_lcs_ratio",
+                 "skel_token_set_ratio"]
 RELATIVE_FEATURES = [f"{c}_gap_to_best" for c in RELATIVE_BASE]
-FEATURES = RETRIEVAL_FEATURES + STRING_FEATURES + RELATIVE_FEATURES
+FEATURES = RETRIEVAL_FEATURES + STRING_FEATURES + SKELETON_FEATURES + RELATIVE_FEATURES
 THRESHOLD_GRID = np.round(np.arange(0.05, 0.96, 0.01), 2)
 
 
@@ -72,13 +75,16 @@ def log(msg: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def load_split(data_dir: str, prefix: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """(source1, targets) with clean columns; targets = S2 and S3 stacked, with a `source` column."""
-    s1 = add_clean_columns(load_tsv(os.path.join(data_dir, f"{prefix}_source1.tsv")))
-    targets = pd.concat(
+    """(source1, targets) with clean columns and name skeletons; targets = S2 and S3 stacked,
+    with a `source` column."""
+    s1 = add_clean_columns(load_tsv(os.path.join(data_dir, f"{prefix}_source1.tsv"))).reset_index(drop=True)
+    targets = add_clean_columns(pd.concat(
         [load_tsv(os.path.join(data_dir, f"{prefix}_source{i}.tsv")).assign(source=f"S{i}") for i in (2, 3)],
         ignore_index=True,
-    )
-    return s1.reset_index(drop=True), add_clean_columns(targets)
+    ))
+    for df in (s1, targets):
+        df["name_skeleton"] = name_skeleton_series(df["name_clean"])
+    return s1, targets
 
 
 def owner_index(ground_truth: pd.DataFrame, s1: pd.DataFrame, targets: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
@@ -108,19 +114,21 @@ def _pair_cosine(T, S, t_rows: np.ndarray, s_rows: np.ndarray, chunk_size: int =
 
 
 def retrieve(s1: pd.DataFrame, targets: pd.DataFrame, k: int = K, max_df: int = MAX_DF,
-             k_name: int = 0, name_max_df: float = 0.01) -> pd.DataFrame:
+             k_name: int = 0, name_max_df: float = 0.01, name_channel: str = "skeleton") -> pd.DataFrame:
     """Candidate S1 rows per target row, same country only, from two TF-IDF channels:
     the top-k by word cosine over name + address ("combined"), and, if k_name > 0, the
-    top-k_name by character 3-5-gram cosine over the name alone ("name"). Every candidate
-    of the union gets both cosines. Returns rows (tgt, s1, cos, cos_name, ...) sorted by
-    target then descending combined cosine, plus retrieval features."""
+    top-k_name by character n-gram cosine over the name alone ("name": 2-4-grams of the
+    phonetic name skeleton, or 3-5-grams of name_clean if name_channel == "char"). Every
+    candidate of the union gets both cosines. Returns rows (tgt, s1, cos, cos_name, ...)
+    sorted by target then descending combined cosine, plus retrieval features."""
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sparse_dot_topn import sp_matmul_topn
 
     s1_text = (s1["name_clean"] + " " + s1["address_clean"]).to_numpy()
     tg_text = (targets["name_clean"] + " " + targets["address_clean"]).to_numpy()
-    s1_name = s1["name_clean"].to_numpy()
-    tg_name = targets["name_clean"].to_numpy()
+    name_col, ngrams = ("name_clean", (3, 5)) if name_channel == "char" else ("name_skeleton", (2, 4))
+    s1_name = s1[name_col].to_numpy()
+    tg_name = targets[name_col].to_numpy()
     s1_country = s1["country"].fillna("").to_numpy()
     tg_country = targets["country"].fillna("").to_numpy()
     n_threads = os.cpu_count()
@@ -147,7 +155,7 @@ def retrieve(s1: pd.DataFrame, targets: pd.DataFrame, k: int = K, max_df: int = 
 
         SN = TN = None
         if k_name > 0:
-            vec_name = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=2, max_df=name_max_df,
+            vec_name = TfidfVectorizer(analyzer="char_wb", ngram_range=ngrams, min_df=2, max_df=name_max_df,
                                        sublinear_tf=True, dtype=np.float32)
             try:
                 SN = vec_name.fit_transform(s1_name[i1])
@@ -272,6 +280,17 @@ def feature_matrix(cands: pd.DataFrame, s1: pd.DataFrame, targets: pd.DataFrame,
             pa, pb, fut = pending.popleft()
             store(pa, pb, fut.result())
 
+    from rapidfuzz import fuzz
+    from rapidfuzz.process import cpdist
+
+    s1_skel = s1["name_skeleton"].to_numpy(dtype=object)
+    tg_skel = targets["name_skeleton"].to_numpy(dtype=object)
+    for j, scorer in enumerate((fuzz.token_set_ratio, fuzz.ratio)):
+        col = FEATURES.index(SKELETON_FEATURES[j])
+        for a, b in chunks:
+            X[a:b, col] = cpdist(s1_skel[s1_idx[a:b]], tg_skel[tg_idx[a:b]], scorer=scorer, workers=-1,
+                                 dtype=np.float32) / 100
+
     # Gap to the best value among the same target's candidates (cands is sorted by target).
     tgt = tg_idx
     starts = np.flatnonzero(np.r_[True, tgt[1:] != tgt[:-1]])
@@ -371,7 +390,8 @@ def run_train(args) -> None:
     owner, true_count = owner_index(ground_truth, s1, targets)
     log(f"loaded {len(s1):,} S1 / {len(targets):,} targets")
 
-    cands = retrieve(s1, targets, k=args.k, max_df=args.max_df, k_name=args.k_name, name_max_df=args.name_max_df)
+    cands = retrieve(s1, targets, k=args.k, max_df=args.max_df, k_name=args.k_name,
+                     name_max_df=args.name_max_df, name_channel=args.name_channel)
     tgt, s1_idx = cands["tgt"].to_numpy(), cands["s1"].to_numpy()
     label = (owner[tgt] == s1_idx).astype(np.int8)
     matched = owner >= 0
@@ -487,7 +507,7 @@ def run_train(args) -> None:
     info = {
         "threshold": float(best_t), "validation_entity_macro_f0.5": best_score,
         "retrieval_ceiling_f0.5": ceiling, "k": args.k, "max_df": args.max_df, "k_name": args.k_name,
-        "name_max_df": args.name_max_df,
+        "name_max_df": args.name_max_df, "name_channel": args.name_channel,
         "features": FEATURES, "n_trees": booster.best_iteration,
         "lgbm_weight": float(lgbm_weight),
         "country_thresholds": country_thresholds,
@@ -513,7 +533,7 @@ def run_predict(args) -> None:
     s1, targets = load_split(args.data_dir, args.split)
     log(f"loaded {len(s1):,} S1 / {len(targets):,} targets")
     cands = retrieve(s1, targets, k=info["k"], max_df=info["max_df"], k_name=info.get("k_name", 0),
-                     name_max_df=info.get("name_max_df", 0.01))
+                     name_max_df=info.get("name_max_df", 0.01), name_channel=info.get("name_channel", "char"))
     # A model trained with an earlier feature set uses its own columns.
     feature_idx = None if info["features"] == FEATURES else [FEATURES.index(f) for f in info["features"]]
     t0 = time.time()
@@ -566,6 +586,7 @@ def main() -> None:
     train.add_argument("--max-df", type=int, default=MAX_DF)
     train.add_argument("--k-name", type=int, default=K_NAME, help="Name-channel candidates; 0 disables it.")
     train.add_argument("--name-max-df", type=float, default=0.01)
+    train.add_argument("--name-channel", default="skeleton", choices=["skeleton", "char"])
     train.add_argument("--val-frac", type=float, default=0.2)
     train.add_argument("--train-target-frac", type=float, default=0.4)
     train.add_argument("--learning-rate", type=float, default=0.1)
