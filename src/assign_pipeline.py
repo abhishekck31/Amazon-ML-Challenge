@@ -586,20 +586,25 @@ def run_tune_guard(args) -> None:
     base = entity_macro_f05(bt, bs, bp, owner, true_count, val_rows, base_t)
     log(f"reproduced validation F0.5 {base:.5f} at threshold {base_t:.2f} "
         f"(training run reported {info['validation_entity_macro_f0.5']:.5f})")
-    results = []
-    for t in np.round(np.arange(0.45, 0.81, 0.01), 2):
-        for ts in np.round(np.arange(t, 1.0, 0.01), 2):
+    # (score, threshold, lone-match threshold or None for no guard); the current setting is included.
+    results = [(base, base_t, None)]
+    for t in sorted(set(np.round(np.arange(0.45, 0.81, 0.01), 2)) | {round(base_t, 2)}):
+        for ts in [None] + list(np.round(np.arange(t + 0.01, 1.0, 0.01), 2)):
             results.append((entity_macro_f05(bt, bs, bp, owner, true_count, val_rows, t, ts), t, ts))
-    results.sort(reverse=True)
+    results.sort(key=lambda r: r[0], reverse=True)
+    describe = lambda t, ts: f"threshold {t:.2f}, lone-match " + ("off" if ts is None else f"threshold {ts:.2f}")
     for score, t, ts in results[:8]:
-        log(f"  threshold {t:.2f}, lone-match threshold {ts:.2f}: F0.5 {score:.5f}")
+        log(f"  {describe(t, ts)}: F0.5 {score:.5f}")
     best_score, best_t, best_ts = results[0]
-    gain = best_score - base
-    log(f"best: threshold {best_t:.2f}, lone-match threshold {best_ts:.2f} -> {best_score:.5f} ({gain:+.5f})")
+    log(f"best: {describe(best_t, best_ts)} -> {best_score:.5f} ({best_score - base:+.5f} vs current)")
+    if best_score <= base:
+        log(f"no improvement; {info_path} unchanged ({time.time() - t_start:.0f}s total)")
+        return
 
     (Path(args.models_dir) / "assign_info_before_guard.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
     info.update({
-        "threshold": float(best_t), "sole_threshold": float(best_ts), "country_thresholds": {},
+        "threshold": float(best_t), "sole_threshold": None if best_ts is None else float(best_ts),
+        "country_thresholds": {},
         "validation_entity_macro_f0.5_before_guard": base, "validation_entity_macro_f0.5": best_score,
     })
     info_path.write_text(json.dumps(info, indent=2), encoding="utf-8")
