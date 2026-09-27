@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 
+import numpy as np
 import pandas as pd
 from anyascii import anyascii
 
@@ -46,10 +47,37 @@ LEGAL_SUFFIXES = [
 LEGAL_SUFFIX_PATTERN = r"\b(" + "|".join(LEGAL_SUFFIXES) + r")\b"
 PUNCTUATION_PATTERN = r"[^a-z0-9\s]"
 MULTI_SPACE_PATTERN = r"\s+"
+# Zero-padded numbers ("House No-008", "A-0060") lose their padding: "8", "60".
+LEADING_ZEROS_PATTERN = r"\b0+(\d)"  # replaced by r"\1"; no lookahead, which RE2 lacks
+
+# Phonetic consonant skeleton of a clean name, so an English name and its transliteration
+# from an Indian script reduce to the same key: "southern" / "sdrn" -> "strn", "trading" /
+# "tredimg" -> "trtnk", "private" / "praivet" / "praibhet" -> "prbt". Aspirates lose their
+# "h", soft c/g are folded, similar consonants are merged and vowels are dropped.
+SKELETON_STEPS = [
+    (r"x", "ks"),
+    (r"([pbktdscg])h", r"\1"),
+    (r"c(?=[eiy])", "s"),
+    (r"g(?=[eiy])", "j"),
+    (r"[cqg]", "k"),
+    (r"f", "p"),
+    (r"[vw]", "b"),
+    (r"d", "t"),
+    (r"[zj]", "s"),
+    (r"m", "n"),
+    (r"[aeiouyh]", ""),
+    (r"([a-z])\1+", r"\1"),
+]
+# Skeletons of transliterated legal forms ("praivet", "limitet", "pra. li.") that the
+# English LEGAL_SUFFIXES miss.
+SKELETON_STOP_PATTERN = r"\b(prbt|pbt|lnt|lt|pr|l)\b"
 
 _LEGAL_SUFFIX_RE = re.compile(LEGAL_SUFFIX_PATTERN)
 _PUNCTUATION_RE = re.compile(PUNCTUATION_PATTERN)
 _MULTI_SPACE_RE = re.compile(MULTI_SPACE_PATTERN)
+_LEADING_ZEROS_RE = re.compile(LEADING_ZEROS_PATTERN)
+_SKELETON_RES = [(re.compile(p), r) for p, r in SKELETON_STEPS]
+_SKELETON_STOP_RE = re.compile(SKELETON_STOP_PATTERN)
 
 # Street-designator synonyms for address_clean, so "123 Main Rd" and "123 Main Road"
 # block/match together. Deliberately does NOT include "st" -> "street": "St" is
@@ -96,6 +124,7 @@ def normalize_text(value, remove_legal_suffixes: bool = False, expand_street_syn
     text = text.lower()
     text = text.replace("&", " and ")
     text = _PUNCTUATION_RE.sub(" ", text)
+    text = _LEADING_ZEROS_RE.sub(r"\1", text)
     if remove_legal_suffixes:
         text = _LEGAL_SUFFIX_RE.sub(" ", text)
     if expand_street_synonyms:
@@ -124,6 +153,7 @@ def normalize_name_series(s: pd.Series) -> pd.Series:
     text = strip_accents_series(s).str.lower()
     text = text.str.replace("&", " and ", regex=False)
     text = text.str.replace(PUNCTUATION_PATTERN, " ", regex=True)
+    text = text.str.replace(LEADING_ZEROS_PATTERN, r"\1", regex=True)
     text = text.str.replace(LEGAL_SUFFIX_PATTERN, " ", regex=True)
     text = text.str.replace(MULTI_SPACE_PATTERN, " ", regex=True).str.strip()
     return text
@@ -134,9 +164,27 @@ def normalize_address_series(s: pd.Series) -> pd.Series:
     text = strip_accents_series(s).str.lower()
     text = text.str.replace("&", " and ", regex=False)
     text = text.str.replace(PUNCTUATION_PATTERN, " ", regex=True)
+    text = text.str.replace(LEADING_ZEROS_PATTERN, r"\1", regex=True)
     text = text.str.replace(STREET_SYNONYM_PATTERN, lambda m: STREET_SYNONYMS[m.group(0)], regex=True)
     text = text.str.replace(MULTI_SPACE_PATTERN, " ", regex=True).str.strip()
     return text
+
+
+def name_skeleton(name_clean: str) -> str:
+    """Phonetic consonant skeleton (see SKELETON_STEPS) of an already-cleaned name."""
+    text = name_clean
+    for pattern, repl in _SKELETON_RES:
+        text = pattern.sub(repl, text)
+    text = _SKELETON_STOP_RE.sub(" ", text)
+    return _MULTI_SPACE_RE.sub(" ", text).strip()
+
+
+def name_skeleton_series(name_clean: pd.Series) -> pd.Series:
+    """name_skeleton over a column, computed once per distinct name. (Python re: the
+    skeleton rules use lookaheads and backreferences, which pyarrow's RE2 lacks.)"""
+    codes, uniques = pd.factorize(name_clean.fillna("").astype(str))
+    skeletons = np.array([name_skeleton(u) for u in uniques], dtype=object)
+    return pd.Series(skeletons[codes], index=name_clean.index)
 
 
 def add_clean_columns(

@@ -26,12 +26,16 @@ data/
 
 # Models & Checkpoints
 models/
+models_*/
+logs/
+output/
 checkpoints/
 catboost_info/
 *.pth
 *.pt
 *.bin
 *.onnx
+*.cbm
 
 # Environment & IDE
 .env

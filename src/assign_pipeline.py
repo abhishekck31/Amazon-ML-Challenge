@@ -48,9 +48,12 @@ from src.preprocessing import add_clean_columns
 
 K = 10
 MAX_DF = 5000
+K_NAME = 10
 STRING_FEATURES = FEATURE_COLUMNS[:20]
 RETRIEVAL_FEATURES = ["cos", "rank", "gap_to_top1", "margin_to_next", "n_cands", "s1_top1_count", "s1_cand_count",
-                      "s1_reverse_rank", "s1_best_cos_gap"]
+                      "s1_reverse_rank", "s1_best_cos_gap",
+                      "cos_name", "name_rank", "name_gap_to_top1",
+                      "in_name_retrieval", "in_combined_retrieval", "both_channels_retrieved"]
 # Assignment picks the best of a target's K candidates, so how a candidate compares to its
 # competitors matters as much as its absolute similarity.
 RELATIVE_BASE = ["name_jaro_winkler", "token_sort_ratio", "name_bigram_jaccard",
@@ -95,16 +98,35 @@ def owner_index(ground_truth: pd.DataFrame, s1: pd.DataFrame, targets: pd.DataFr
 # Retrieval
 # --------------------------------------------------------------------------- #
 
-def retrieve(s1: pd.DataFrame, targets: pd.DataFrame, k: int = K, max_df: int = MAX_DF) -> pd.DataFrame:
-    """Top-k S1 rows per target row by TF-IDF cosine, same country only. Returns rows
-    (tgt, s1, cos) sorted by target then descending cosine, plus retrieval features."""
+def _pair_cosine(T, S, t_rows: np.ndarray, s_rows: np.ndarray, chunk_size: int = 1_000_000) -> np.ndarray:
+    """Cosine of explicit (T row, S row) pairs; both matrices are L2-normalized TF-IDF."""
+    out = np.empty(t_rows.size, dtype=np.float32)
+    for a in range(0, t_rows.size, chunk_size):
+        b = min(a + chunk_size, t_rows.size)
+        out[a:b] = np.asarray(T[t_rows[a:b]].multiply(S[s_rows[a:b]]).sum(axis=1)).ravel()
+    return out
+
+
+def retrieve(s1: pd.DataFrame, targets: pd.DataFrame, k: int = K, max_df: int = MAX_DF,
+             k_name: int = 0, name_max_df: float = 0.01) -> pd.DataFrame:
+    """Candidate S1 rows per target row, same country only, from two TF-IDF channels:
+    the top-k by word cosine over name + address ("combined"), and, if k_name > 0, the
+    top-k_name by character 3-5-gram cosine over the name alone ("name"). Every candidate
+    of the union gets both cosines. Returns rows (tgt, s1, cos, cos_name, ...) sorted by
+    target then descending combined cosine, plus retrieval features."""
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sparse_dot_topn import sp_matmul_topn
 
     s1_text = (s1["name_clean"] + " " + s1["address_clean"]).to_numpy()
     tg_text = (targets["name_clean"] + " " + targets["address_clean"]).to_numpy()
+    s1_name = s1["name_clean"].to_numpy()
+    tg_name = targets["name_clean"].to_numpy()
     s1_country = s1["country"].fillna("").to_numpy()
     tg_country = targets["country"].fillna("").to_numpy()
+    n_threads = os.cpu_count()
+
+    def local_keys(R, n1):
+        return np.repeat(np.arange(R.shape[0], dtype=np.int64), np.diff(R.indptr)) * n1 + R.indices
 
     parts = []
     for country in sorted(set(s1_country) - {""}):
@@ -116,17 +138,54 @@ def retrieve(s1: pd.DataFrame, targets: pd.DataFrame, k: int = K, max_df: int = 
         vec = TfidfVectorizer(token_pattern=r"\b\w+\b", max_df=max_df, sublinear_tf=True, dtype=np.float32)
         S = vec.fit_transform(s1_text[i1])
         T = vec.transform(tg_text[it])
-        R = sp_matmul_topn(T, S.T.tocsr(), top_n=k, sort=True, n_threads=os.cpu_count())
-        rows = np.repeat(np.arange(R.shape[0]), np.diff(R.indptr))
+        R = sp_matmul_topn(T, S.T.tocsr(), top_n=k, sort=True, n_threads=n_threads)
+        keys = local_keys(R, i1.size)
+        cos = R.data.astype(np.float32)
+        cos_name = np.zeros(keys.size, dtype=np.float32)
+        in_comb = np.ones(keys.size, dtype=np.float32)
+        in_name = np.zeros(keys.size, dtype=np.float32)
+
+        SN = TN = None
+        if k_name > 0:
+            vec_name = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=2, max_df=name_max_df,
+                                       sublinear_tf=True, dtype=np.float32)
+            try:
+                SN = vec_name.fit_transform(s1_name[i1])
+            except ValueError:  # too few S1 records for the document-frequency limits
+                log(f"retrieval {country}: name channel skipped ({i1.size:,} S1 records)")
+        if SN is not None:
+            TN = vec_name.transform(tg_name[it])
+            RN = sp_matmul_topn(TN, SN.T.tocsr(), top_n=k_name, sort=True, n_threads=n_threads)
+            keys_name = local_keys(RN, i1.size)
+            union = np.union1d(keys, keys_name)
+            pos_comb = np.searchsorted(union, keys)
+            pos_name = np.searchsorted(union, keys_name)
+            u_cos = np.zeros(union.size, dtype=np.float32)
+            u_cos_name = np.zeros(union.size, dtype=np.float32)
+            in_comb = np.zeros(union.size, dtype=np.float32)
+            in_name = np.zeros(union.size, dtype=np.float32)
+            u_cos[pos_comb], in_comb[pos_comb] = cos, 1
+            u_cos_name[pos_name], in_name[pos_name] = RN.data, 1
+            # Each channel's cosine for the candidates only the other channel retrieved.
+            t_loc, s_loc = union // i1.size, union % i1.size
+            miss = in_comb == 0
+            u_cos[miss] = _pair_cosine(T, S, t_loc[miss], s_loc[miss])
+            miss = in_name == 0
+            u_cos_name[miss] = _pair_cosine(TN, SN, t_loc[miss], s_loc[miss])
+            keys, cos, cos_name = union, u_cos, u_cos_name
         parts.append(pd.DataFrame({
-            "tgt": it[rows].astype(np.int32),
-            "s1": i1[R.indices].astype(np.int32),
-            "cos": R.data.astype(np.float32),
+            "tgt": it[keys // i1.size].astype(np.int32),
+            "s1": i1[keys % i1.size].astype(np.int32),
+            "cos": cos, "cos_name": cos_name,
+            "in_combined_retrieval": in_comb, "in_name_retrieval": in_name,
         }))
-        log(f"retrieval {country}: {i1.size:,} S1 x {it.size:,} targets -> {R.nnz:,} pairs "
-            f"({len(vec.vocabulary_):,} tokens, {time.time() - t0:.0f}s)")
+        log(f"retrieval {country}: {i1.size:,} S1 x {it.size:,} targets -> {keys.size:,} pairs "
+            f"({int(in_name.sum()):,} from the name channel, {int((in_name * in_comb).sum()):,} from both; "
+            f"{time.time() - t0:.0f}s)")
+        del S, T, SN, TN
 
     cands = pd.concat(parts, ignore_index=True)
+    del parts
     order = np.lexsort((-cands["cos"].to_numpy(), cands["tgt"].to_numpy()))
     cands = cands.iloc[order].reset_index(drop=True)
 
@@ -154,6 +213,15 @@ def retrieve(s1: pd.DataFrame, targets: pd.DataFrame, k: int = K, max_df: int = 
     best_cos[by_s1] = np.repeat(cos[by_s1][s1_starts], s1_lengths)
     cands["s1_reverse_rank"] = reverse_rank
     cands["s1_best_cos_gap"] = best_cos - cos
+
+    # The same target-relative view of the name channel.
+    cos_name = cands["cos_name"].to_numpy()
+    by_name = np.lexsort((-cos_name, tgt))
+    name_rank = np.empty(tgt.size, dtype=np.float32)
+    name_rank[by_name] = np.arange(tgt.size) - np.repeat(starts, lengths)
+    cands["name_rank"] = name_rank
+    cands["name_gap_to_top1"] = np.repeat(np.maximum.reduceat(cos_name, starts), lengths) - cos_name
+    cands["both_channels_retrieved"] = cands["in_combined_retrieval"] * cands["in_name_retrieval"]
     return cands
 
 
@@ -214,6 +282,29 @@ def feature_matrix(cands: pd.DataFrame, s1: pd.DataFrame, targets: pd.DataFrame,
         X[:, FEATURES.index(RELATIVE_FEATURES[j])] = col - best
     log(f"features done: {n:,} rows in {time.time() - t0:.0f}s")
     return X
+
+
+def score_rows(cands: pd.DataFrame, rows: np.ndarray, s1: pd.DataFrame, targets: pd.DataFrame, predict_fns,
+               feature_idx=None, chunk_rows: int = 15_000_000):
+    """Each predict_fn's probabilities for the cands rows `rows` (ascending, whole targets
+    only). Features are built in target-aligned chunks, so only one chunk's matrix is in
+    memory at a time. feature_idx selects the model's columns from FEATURES."""
+    tgt = cands["tgt"].to_numpy()[rows]
+    starts = np.flatnonzero(np.r_[True, tgt[1:] != tgt[:-1]])
+    out = [np.empty(rows.size, dtype=np.float32) for _ in predict_fns]
+    a = 0
+    while a < rows.size:
+        nxt = np.searchsorted(starts, a + chunk_rows)
+        b = starts[nxt] if nxt < starts.size else rows.size
+        X = feature_matrix(cands.iloc[rows[a:b]], s1, targets)
+        if feature_idx is not None:
+            X = X[:, feature_idx]
+        for o, fn in zip(out, predict_fns):
+            o[a:b] = predict_chunked(fn, X)
+        del X
+        log(f"scored {b:,}/{rows.size:,} pairs")
+        a = b
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -280,23 +371,33 @@ def run_train(args) -> None:
     owner, true_count = owner_index(ground_truth, s1, targets)
     log(f"loaded {len(s1):,} S1 / {len(targets):,} targets")
 
-    cands = retrieve(s1, targets, k=args.k, max_df=args.max_df)
-    label = (owner[cands["tgt"].to_numpy()] == cands["s1"].to_numpy()).astype(np.int8)
+    cands = retrieve(s1, targets, k=args.k, max_df=args.max_df, k_name=args.k_name, name_max_df=args.name_max_df)
+    tgt, s1_idx = cands["tgt"].to_numpy(), cands["s1"].to_numpy()
+    label = (owner[tgt] == s1_idx).astype(np.int8)
     matched = owner >= 0
     retrieved = np.zeros(len(targets), dtype=bool)
-    retrieved[cands["tgt"].to_numpy()[label == 1]] = True
-    log(f"{len(cands):,} candidate pairs; owner retrieved for {retrieved[matched].mean():.4f} of matched targets")
-
-    X = feature_matrix(cands, s1, targets)
+    retrieved[tgt[label == 1]] = True
+    log(f"{len(cands):,} candidate pairs ({len(cands) / len(targets):.1f} per target); "
+        f"owner retrieved for {retrieved[matched].mean():.4f} of matched targets")
+    if args.k_name > 0:
+        pos = label == 1
+        for col in ("in_combined_retrieval", "in_name_retrieval", "both_channels_retrieved"):
+            hit = np.zeros(len(targets), dtype=bool)
+            hit[tgt[pos & (cands[col].to_numpy() == 1)]] = True
+            log(f"  {col}: owner found for {hit[matched].mean():.4f} of matched targets")
 
     rng = np.random.default_rng(args.seed)
     val_entity = rng.random(len(s1)) < args.val_frac
     target_sample = rng.random(len(targets)) < args.train_target_frac
-    pair_val_entity = val_entity[cands["s1"].to_numpy()]
-    pair_target_sampled = target_sample[cands["tgt"].to_numpy()]
-    train_rows = np.flatnonzero(~pair_val_entity & pair_target_sampled)
-    es_rows = np.flatnonzero(pair_val_entity & (rng.random(len(cands)) < 0.1))
-    log(f"training on {train_rows.size:,} pairs ({label[train_rows].mean():.3f} positive), "
+    # Features for the sampled targets only (with all their candidates, so target-relative
+    # features are exact); everything else is scored in chunks after training.
+    fit_rows = np.flatnonzero(target_sample[tgt])
+    X = feature_matrix(cands.iloc[fit_rows], s1, targets)
+    fit_label = label[fit_rows]
+    fit_val = val_entity[s1_idx[fit_rows]]
+    train_rows = np.flatnonzero(~fit_val)
+    es_rows = np.flatnonzero(fit_val & (rng.random(fit_rows.size) < 0.2))
+    log(f"training on {train_rows.size:,} pairs ({fit_label[train_rows].mean():.3f} positive), "
         f"early stopping on {es_rows.size:,}")
 
     params = {
@@ -304,18 +405,15 @@ def run_train(args) -> None:
         "min_data_in_leaf": 200, "feature_fraction": 0.9, "bagging_fraction": 0.8, "bagging_freq": 1,
         "verbosity": -1, "num_threads": os.cpu_count(), "seed": args.seed,
     }
-    dtrain = lgb.Dataset(X[train_rows], label=label[train_rows], feature_name=FEATURES, free_raw_data=True)
-    des = lgb.Dataset(X[es_rows], label=label[es_rows], reference=dtrain)
+    dtrain = lgb.Dataset(X[train_rows], label=fit_label[train_rows], feature_name=FEATURES, free_raw_data=True)
+    des = lgb.Dataset(X[es_rows], label=fit_label[es_rows], reference=dtrain)
     t0 = time.time()
     booster = lgb.train(params, dtrain, num_boost_round=args.num_boost_round, valid_sets=[des],
                         valid_names=["early_stop"],
                         callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(50)])
     log(f"trained {booster.best_iteration} trees in {time.time() - t0:.0f}s")
     del dtrain, des
-
-    t0 = time.time()
-    prob_lgbm = predict_chunked(lambda x: booster.predict(x, num_iteration=booster.best_iteration), X)
-    log(f"predicted {len(prob_lgbm):,} pairs in {time.time() - t0:.0f}s")
+    predict_fns = [lambda x: booster.predict(x, num_iteration=booster.best_iteration)]
 
     cat = None
     if args.cat_iterations > 0:
@@ -325,9 +423,22 @@ def run_train(args) -> None:
                                  thread_count=os.cpu_count(), random_seed=args.seed, od_type="Iter", od_wait=30,
                                  verbose=100)
         t0 = time.time()
-        cat.fit(X[train_rows], label[train_rows], eval_set=(X[es_rows], label[es_rows]), use_best_model=True)
+        cat.fit(X[train_rows], fit_label[train_rows], eval_set=(X[es_rows], fit_label[es_rows]),
+                use_best_model=True)
         log(f"trained CatBoost ({cat.get_best_iteration()} trees) in {time.time() - t0:.0f}s")
-        prob_cat = predict_chunked(lambda x: cat.predict_proba(x)[:, 1], X)
+        predict_fns.append(lambda x: cat.predict_proba(x)[:, 1])
+
+    t0 = time.time()
+    probs = [np.empty(len(cands), dtype=np.float32) for _ in predict_fns]
+    for p, fn in zip(probs, predict_fns):
+        p[fit_rows] = predict_chunked(fn, X)
+    del X
+    rest = np.flatnonzero(~target_sample[tgt])
+    for p, q in zip(probs, score_rows(cands, rest, s1, targets, predict_fns)):
+        p[rest] = q
+    prob_lgbm = probs[0]
+    prob_cat = probs[1] if cat is not None else None
+    log(f"predicted {len(cands):,} pairs in {time.time() - t0:.0f}s")
 
     val_rows = np.flatnonzero(val_entity)
 
@@ -375,7 +486,8 @@ def run_train(args) -> None:
         cat.save_model(str(Path(args.models_dir) / "assign_catboost.cbm"))
     info = {
         "threshold": float(best_t), "validation_entity_macro_f0.5": best_score,
-        "retrieval_ceiling_f0.5": ceiling, "k": args.k, "max_df": args.max_df,
+        "retrieval_ceiling_f0.5": ceiling, "k": args.k, "max_df": args.max_df, "k_name": args.k_name,
+        "name_max_df": args.name_max_df,
         "features": FEATURES, "n_trees": booster.best_iteration,
         "lgbm_weight": float(lgbm_weight),
         "country_thresholds": country_thresholds,
@@ -400,20 +512,26 @@ def run_predict(args) -> None:
 
     s1, targets = load_split(args.data_dir, args.split)
     log(f"loaded {len(s1):,} S1 / {len(targets):,} targets")
-    cands = retrieve(s1, targets, k=info["k"], max_df=info["max_df"])
-    X = feature_matrix(cands, s1, targets)
-    if info["features"] != FEATURES:  # a model trained with an earlier feature set
-        X = X[:, [FEATURES.index(f) for f in info["features"]]]
+    cands = retrieve(s1, targets, k=info["k"], max_df=info["max_df"], k_name=info.get("k_name", 0),
+                     name_max_df=info.get("name_max_df", 0.01))
+    # A model trained with an earlier feature set uses its own columns.
+    feature_idx = None if info["features"] == FEATURES else [FEATURES.index(f) for f in info["features"]]
     t0 = time.time()
     lgbm_weight = info.get("lgbm_weight", 1.0)
-    prob = predict_chunked(booster.predict, X) if lgbm_weight > 0 else np.zeros(len(X), dtype=np.float32)
+    predict_fns, weights = [], []
+    if lgbm_weight > 0:
+        predict_fns.append(booster.predict)
+        weights.append(lgbm_weight)
     if lgbm_weight < 1:
         from catboost import CatBoostClassifier
 
         cat = CatBoostClassifier().load_model(str(Path(args.models_dir) / "assign_catboost.cbm"))
-        prob = lgbm_weight * prob + (1 - lgbm_weight) * predict_chunked(lambda x: cat.predict_proba(x)[:, 1], X)
+        predict_fns.append(lambda x: cat.predict_proba(x)[:, 1])
+        weights.append(1 - lgbm_weight)
+    probs = score_rows(cands, np.arange(len(cands)), s1, targets, predict_fns, feature_idx=feature_idx)
+    prob = sum(w * p for w, p in zip(weights, probs)).astype(np.float32)
+    del probs
     log(f"predicted {len(prob):,} pairs (lgbm weight {lgbm_weight:.2f}) in {time.time() - t0:.0f}s")
-    del X
 
     best_tgt, best_s1, best_prob = assign(cands, prob)
     # Per-country thresholds unless overridden; countries unseen in training use the global one.
@@ -446,6 +564,8 @@ def main() -> None:
     train.add_argument("--models-dir", default="models_v2")
     train.add_argument("--k", type=int, default=K)
     train.add_argument("--max-df", type=int, default=MAX_DF)
+    train.add_argument("--k-name", type=int, default=K_NAME, help="Name-channel candidates; 0 disables it.")
+    train.add_argument("--name-max-df", type=float, default=0.01)
     train.add_argument("--val-frac", type=float, default=0.2)
     train.add_argument("--train-target-frac", type=float, default=0.4)
     train.add_argument("--learning-rate", type=float, default=0.1)
